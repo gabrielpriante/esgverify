@@ -19,7 +19,6 @@ from typing import Any
 import httpx
 import structlog
 from tenacity import (
-    before_sleep_log,
     retry,
     retry_if_exception_type,
     stop_after_attempt,
@@ -82,11 +81,12 @@ Extract all ESG claims from the following document excerpt (chunk {chunk_index})
 # ---------------------------------------------------------------------------
 
 
+import logging as stdlib_logging
+
 @retry(
     retry=retry_if_exception_type((httpx.HTTPError, httpx.TimeoutException)),
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
-    before_sleep=before_sleep_log(logger, "warning"),  # type: ignore[arg-type]
     reraise=True,
 )
 async def _call_ollama(prompt: str, chunk_index: int) -> str:

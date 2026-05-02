@@ -1,72 +1,242 @@
 """
 Analysis pipeline orchestrator.
 
-This module coordinates the full ESG analysis pipeline. Each stage is a
-separate module so that stages can be tested, swapped, and improved
-independently.
-
-Current status: STUB — returns empty results.
-Phase 2 will implement each stage below.
+Coordinates the full ESG analysis pipeline. Each stage is a separate module
+so that stages can be tested, swapped, and improved independently.
 
 Pipeline stages
 ---------------
-1. Chunker         Split the document into overlapping text chunks
-2. ClaimExtractor  Use Ollama (LLaMA 3.1) to identify ESG claims per chunk
-3. EvidenceRetriever  Use ChromaDB to find evidence related to each claim
-4. ClaimClassifier    Use ClimateBERT to classify claims by ESG category
-5. GapScorer          Use Ollama to reason about substantiation quality
-6. ReportBuilder      Aggregate results into an AnalysisReport
+1. Chunker            Split document text into overlapping chunks
+2. ClaimExtractor     Identify ESG claims per chunk via Ollama (LLaMA 3.1)
+3. ClaimAnalyzer      Score each claim for substantiation and greenwashing risk
+4. EvidenceRetriever  Find supporting evidence passages via ChromaDB + embeddings
+5. ReportBuilder      Aggregate results into an AnalysisReport  ← stub
 """
 
+from __future__ import annotations
+
 import uuid
+from collections import Counter
+
 import structlog
 
-from backend.core.models.report import AnalysisReport, AnalysisSummary, RiskLevel
-from backend.core.models.report import DocumentInput
+from backend.core.models.report import (
+    AnalysisReport,
+    AnalysisSummary,
+    ClaimAnalysis,
+    DocumentInput,
+    RiskLevel,
+    SubstantiationLevel,
+)
+from backend.core.pipeline.chunker import chunk_text
+from backend.core.pipeline.claim_extractor import extract_claims
+from backend.core.pipeline.claim_analyzer import analyze_claims
+from backend.core.pipeline.evidence_retriever import build_document_index, retrieve_evidence
 
 logger = structlog.get_logger(__name__)
 
 
 async def run_pipeline(document: DocumentInput) -> AnalysisReport:
-    """
-    Run the full ESG analysis pipeline on a parsed document.
+    """Run the full ESG analysis pipeline on a parsed document.
+
+    Executes Stages 1–4 in sequence and assembles the results into an
+    :class:`AnalysisReport`. Stage 5 (report generation / PDF export) is
+    not yet implemented and is represented by the inline report builder
+    at the bottom of this function.
 
     Args:
-        document: Parsed document text wrapped in a DocumentInput model.
+        document: Parsed document text wrapped in a :class:`DocumentInput` model.
 
     Returns:
-        AnalysisReport with all claims analyzed and summarized.
+        :class:`AnalysisReport` with all claims analyzed and summarized.
     """
-    logger.info("Pipeline started", filename=document.filename)
+    log = logger.bind(filename=document.filename)
+    log.info("pipeline_started")
 
+    # ------------------------------------------------------------------
     # Stage 1 — Chunking
-    # chunks = chunk_document(document.content)
+    # ------------------------------------------------------------------
+    chunks = chunk_text(document.content)
+    log.info("stage_1_complete", chunks=len(chunks))
 
+    if not chunks:
+        log.warning("document_produced_no_chunks")
+        return _empty_report(document.filename, reason="Document contained no extractable text.")
+
+    # ------------------------------------------------------------------
     # Stage 2 — Claim extraction
-    # claims = await extract_claims(chunks)
+    # ------------------------------------------------------------------
+    extracted_claims = await extract_claims(chunks)
+    log.info("stage_2_complete", claims_extracted=len(extracted_claims))
 
-    # Stage 3 — Evidence retrieval
-    # claims_with_evidence = await retrieve_evidence(claims, document.content)
+    if not extracted_claims:
+        log.warning("no_claims_extracted")
+        return _empty_report(document.filename, reason="No ESG claims found in document.")
 
-    # Stage 4 — ClimateBERT classification
-    # classified_claims = classify_claims(claims_with_evidence)
+    # ------------------------------------------------------------------
+    # Stage 3 — Claim analysis (substantiation + risk scoring)
+    # ------------------------------------------------------------------
+    analyses = await analyze_claims(extracted_claims)
+    log.info("stage_3_complete", claims_analyzed=len(analyses))
 
-    # Stage 5 — Gap scoring
-    # analyzed_claims = await score_gaps(classified_claims)
+    # ------------------------------------------------------------------
+    # Stage 4 — Evidence retrieval
+    # Build the vector index from the document chunks, then query it for
+    # each claim. Attach the retrieved evidence to each ClaimAnalysis.
+    # ------------------------------------------------------------------
+    build_document_index(chunks, document.filename)
+    evidence_map = retrieve_evidence(extracted_claims, document.filename)
 
-    # Stage 6 — Report assembly
-    # report = build_report(document.filename, analyzed_claims)
+    # Attach retrieved evidence to each analysis, replacing the LLM-only
+    # evidence list with the richer ChromaDB-retrieved passages.
+    enriched_analyses: list[ClaimAnalysis] = []
+    for analysis in analyses:
+        retrieved = evidence_map.get(analysis.claim.claim_id, [])
+        enriched = ClaimAnalysis(
+            claim=analysis.claim,
+            evidence=retrieved if retrieved else analysis.evidence,
+            substantiation_level=analysis.substantiation_level,
+            risk_level=analysis.risk_level,
+            gap_explanation=analysis.gap_explanation,
+            confidence=analysis.confidence,
+        )
+        enriched_analyses.append(enriched)
 
-    # Placeholder until stages are implemented
-    logger.warning("Pipeline is a stub — returning empty report")
-    return _empty_report(document.filename)
+    log.info("stage_4_complete", total_evidence_passages=sum(
+        len(e.evidence) for e in enriched_analyses
+    ))
+
+    # ------------------------------------------------------------------
+    # Stage 5 — Report assembly (inline until Stage 5 module is built)
+    # ------------------------------------------------------------------
+    report = _build_report(document.filename, enriched_analyses)
+    log.info("pipeline_complete", report_id=report.report_id, total_claims=len(enriched_analyses))
+    return report
 
 
-def _empty_report(filename: str) -> AnalysisReport:
+# ---------------------------------------------------------------------------
+# Report builder (inline Stage 5 placeholder)
+# ---------------------------------------------------------------------------
+
+
+def _build_report(filename: str, analyses: list[ClaimAnalysis]) -> AnalysisReport:
+    """Assemble a full :class:`AnalysisReport` from a list of analyzed claims.
+
+    Args:
+        filename: Source document filename.
+        analyses: List of enriched :class:`ClaimAnalysis` objects.
+
+    Returns:
+        Complete :class:`AnalysisReport`.
+    """
+    by_category: Counter[str] = Counter()
+    by_substantiation: Counter[str] = Counter()
+    by_risk: Counter[str] = Counter()
+
+    for a in analyses:
+        by_category[a.claim.esg_category.value] += 1
+        by_substantiation[a.substantiation_level.value] += 1
+        by_risk[a.risk_level.value] += 1
+
+    overall_risk = _compute_overall_risk(by_risk)
+    key_findings = _generate_key_findings(analyses, by_category, by_risk)
+
     return AnalysisReport(
         report_id=str(uuid.uuid4()),
         filename=filename,
-        analysis_version="0.1.0-stub",
+        analysis_version="0.2.0",
+        claims=analyses,
+        summary=AnalysisSummary(
+            total_claims=len(analyses),
+            by_esg_category=dict(by_category),
+            by_substantiation_level=dict(by_substantiation),
+            by_risk_level=dict(by_risk),
+            overall_risk_level=overall_risk,
+            key_findings=key_findings,
+        ),
+    )
+
+
+def _compute_overall_risk(by_risk: Counter[str]) -> RiskLevel:
+    """Derive a single document-level risk from per-claim risk counts.
+
+    Args:
+        by_risk: Counter mapping risk level strings to claim counts.
+
+    Returns:
+        The highest risk level present, weighted by prevalence.
+    """
+    if by_risk.get(RiskLevel.HIGH.value, 0) > 0:
+        return RiskLevel.HIGH
+    if by_risk.get(RiskLevel.MEDIUM.value, 0) > by_risk.get(RiskLevel.LOW.value, 0):
+        return RiskLevel.MEDIUM
+    return RiskLevel.LOW
+
+
+def _generate_key_findings(
+    analyses: list[ClaimAnalysis],
+    by_category: Counter[str],
+    by_risk: Counter[str],
+) -> list[str]:
+    """Generate 3–5 human-readable findings from the analysis results.
+
+    Args:
+        analyses: All analyzed claims.
+        by_category: Claim counts by ESG category.
+        by_risk: Claim counts by risk level.
+
+    Returns:
+        List of finding strings for the report summary.
+    """
+    findings: list[str] = []
+    total = len(analyses)
+
+    findings.append(f"{total} ESG claim{'s' if total != 1 else ''} identified across the document.")
+
+    high_risk_count = by_risk.get(RiskLevel.HIGH.value, 0)
+    if high_risk_count:
+        findings.append(
+            f"{high_risk_count} claim{'s' if high_risk_count != 1 else ''} flagged as high greenwashing risk."
+        )
+
+    # Most common category
+    if by_category:
+        top_cat, top_count = by_category.most_common(1)[0]
+        findings.append(f"Most claims relate to {top_cat.capitalize()} ({top_count} claim{'s' if top_count != 1 else ''}).")
+
+    # Unsubstantiated claims
+    weak_none = sum(
+        1 for a in analyses
+        if a.substantiation_level in (SubstantiationLevel.WEAK, SubstantiationLevel.NONE)
+    )
+    if weak_none:
+        findings.append(
+            f"{weak_none} claim{'s' if weak_none != 1 else ''} {'are' if weak_none != 1 else 'is'} "
+            f"weakly substantiated or unsubstantiated."
+        )
+
+    # Strong claims
+    strong = sum(1 for a in analyses if a.substantiation_level == SubstantiationLevel.STRONG)
+    if strong:
+        findings.append(f"{strong} claim{'s' if strong != 1 else ''} {'are' if strong != 1 else 'is'} well-substantiated.")
+
+    return findings[:5]
+
+
+def _empty_report(filename: str, reason: str = "No claims found.") -> AnalysisReport:
+    """Return a minimal report when the pipeline produces no results.
+
+    Args:
+        filename: Source document filename.
+        reason: Human-readable explanation included in key_findings.
+
+    Returns:
+        Empty :class:`AnalysisReport`.
+    """
+    return AnalysisReport(
+        report_id=str(uuid.uuid4()),
+        filename=filename,
+        analysis_version="0.2.0",
         claims=[],
         summary=AnalysisSummary(
             total_claims=0,
@@ -74,6 +244,6 @@ def _empty_report(filename: str) -> AnalysisReport:
             by_substantiation_level={},
             by_risk_level={},
             overall_risk_level=RiskLevel.LOW,
-            key_findings=["Pipeline not yet implemented."],
+            key_findings=[reason],
         ),
     )

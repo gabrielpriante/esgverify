@@ -149,9 +149,9 @@ def build_document_index(chunks: list[TextChunk], filename: str) -> None:
     ids = [f"chunk_{chunk.index}" for chunk in chunks]
     metadatas = [
         {
-            "chunk_index": chunk.index,
-            "char_start": chunk.char_start,
-            "char_end": chunk.char_end,
+            "chunk_index": int(chunk.index),
+            "char_start": int(chunk.char_start),
+            "char_end": int(chunk.char_end),
         }
         for chunk in chunks
     ]
