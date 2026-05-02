@@ -1,169 +1,178 @@
 # ESGVerify
 
-**LLM-powered ESG claim analysis for sustainability professionals.**
+A local, LLM-powered ESG claim analysis tool for sustainability professionals. ESGVerify analyzes corporate documents — annual reports, sustainability disclosures, marketing materials — and determines whether environmental, social, and governance claims are actually substantiated by evidence in the document.
 
-ESGVerify analyzes corporate sustainability documents — reports, press releases, filings — and evaluates whether environmental, social, and governance (ESG) claims are substantiated by the evidence presented. It reasons about claims, not just keywords.
+> **Disclaimer**: ESGVerify is designed to assist with early screening of ESG claims in corporate communications. It does not constitute legal advice, regulatory compliance assessment, or certification of any kind. For formal evaluation of environmental claims, consult qualified experts and verify against recognized standards.
 
-> This tool is designed for sustainability professionals, researchers, and journalists who need to evaluate corporate ESG communications at scale. It does not constitute legal advice or regulatory compliance verification.
+## What is Greenwashing?
 
----
+Greenwashing occurs when companies make misleading or unsubstantiated environmental claims about their products, services, or operations. Unlike simple keyword scanners, ESGVerify uses a local large language model to reason about whether claims are backed by concrete evidence — distinguishing between a company that says "we are carbon neutral" with third-party certification data and one that says the same thing with nothing to back it up.
 
-## What makes this different
+## Core Principle
 
-Most ESG analysis tools flag green-sounding words. ESGVerify reads the document the way an analyst would:
+**Everything runs locally. No data leaves your machine.** ESGVerify uses Ollama to run LLaMA 3.1 8B on your hardware. No external APIs, no subscriptions, no data privacy concerns.
 
-1. **Extract claims** — Identify specific ESG assertions made in the text
-2. **Find supporting evidence** — Locate data, certifications, or methodology referenced nearby
-3. **Score the gap** — Quantify the distance between what is claimed and what is substantiated
-4. **Classify by framework** — Map claims to EU Taxonomy, GRI Standards, TCFD, or SASB categories
-
-Everything runs locally. No API keys. No data leaves your machine.
-
----
-
-## Tech stack
-
-| Layer | Technology | Why |
-|---|---|---|
-| LLM inference | [Ollama](https://ollama.com) + LLaMA 3.1 8B | Local, free, strong reasoning |
-| Climate NLP | [ClimateBERT](https://huggingface.co/climatebert) | Domain-specific claim classification |
-| Backend | FastAPI | Fast async API, excellent docs |
-| Frontend | React + Vite + Tailwind | Modern, maintainable UI |
-| Document parsing | PyMuPDF + python-docx | Multi-format support |
-| Vector search | ChromaDB | Local semantic retrieval |
-
----
-
-## Project structure
+## Project Structure
 
 ```
 esgverify/
 │
-├── backend/                    # FastAPI application
-│   ├── api/
-│   │   └── routes/             # Endpoint definitions
+├── backend/
+│   ├── api/                        # FastAPI route handlers
 │   ├── core/
-│   │   ├── pipeline/           # Multi-stage analysis pipeline
-│   │   └── models/             # Pydantic data models
-│   ├── services/               # External integrations (Ollama, ChromaDB)
-│   └── utils/                  # Shared helpers
+│   │   ├── config.py               # Settings (Ollama URL, model, chunk sizes)
+│   │   ├── models/
+│   │   │   └── report.py           # Pydantic models: ExtractedClaim, ClaimAnalysis, etc.
+│   │   └── pipeline/
+│   │       ├── orchestrator.py     # Pipeline coordinator (6-stage)
+│   │       ├── chunker.py          # Document text → overlapping chunks
+│   │       └── claim_extractor.py  # Chunks → structured ESG claims via LLM
+│   ├── services/                   # Business logic layer
+│   └── utils/                      # Shared utilities
 │
-├── frontend/                   # React application
-│   └── src/
-│       ├── components/         # Reusable UI components
-│       ├── pages/              # Route-level page components
-│       ├── hooks/              # Custom React hooks
-│       └── lib/                # API client, utilities
+├── tests/
+│   └── unit/
+│       └── test_claim_extractor.py # 18 unit tests, all passing
 │
-├── config/                     # YAML configuration files
-├── data/
-│   ├── samples/                # Example ESG documents for testing
-│   └── schemas/                # ESG framework schemas (GRI, TCFD, etc.)
-├── docs/                       # Architecture and design documentation
-├── scripts/                    # Dev tooling and setup scripts
-└── tests/
-    ├── unit/                   # Unit tests per module
-    └── integration/            # End-to-end pipeline tests
+├── requirements.txt
+└── README.md
 ```
 
----
+## How It Works
 
-## Quickstart
+ESGVerify processes documents through a multi-stage pipeline:
 
-### Prerequisites
+**Stage 1 — Document Ingestion**: Accepts PDF, DOCX, and TXT files. Extracts raw text using PyMuPDF and python-docx.
 
-- Python 3.11+
-- Node.js 18+
-- [Ollama](https://ollama.com/download) installed and running
+**Stage 2 — Claim Extraction** ✅ Complete: Splits document text into overlapping chunks that respect sentence and paragraph boundaries, then sends each chunk to a local LLM (LLaMA 3.1 8B via Ollama). The model identifies ESG claims and returns them as structured JSON — text, context, ESG category (Environmental / Social / Governance), and relevant framework tags (GHG Protocol, TCFD, GRI, UN SDGs, etc.).
 
-### 1. Pull the required model
+**Stages 3–6** — In progress: Claim analysis, evidence cross-referencing, risk scoring, and report generation.
 
+## Requirements
+
+- Python 3.13+
+- [Ollama](https://ollama.com/download) installed and running locally
+- 8GB+ VRAM recommended (the default model uses ~4.7GB)
+- Windows, macOS, or Linux
+
+## Installation
+
+**1. Clone the repository:**
 ```bash
-ollama pull llama3.1:8b
+git clone https://github.com/gabrielpriante/esgverify.git
+cd esgverify
 ```
 
-### 2. Backend setup
-
+**2. Install dependencies:**
 ```bash
-cd backend
-python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-uvicorn api.main:app --reload
+pip install -r backend/requirements.txt
 ```
 
-### 3. Frontend setup
+**3. Install and start Ollama:**
 
+Download from [ollama.com/download](https://ollama.com/download), then pull the recommended model:
 ```bash
-cd frontend
-npm install
-npm run dev
+ollama pull llama3.1:8b-instruct-q4_K_M
 ```
 
-The app will be available at `http://localhost:5173`. The API runs at `http://localhost:8000`.
+This is a one-time ~4.9GB download. The `q4_K_M` quantization uses ~4.7GB VRAM, leaving comfortable headroom on an 8GB card.
 
----
-
-## How the pipeline works
-
+**4. Verify Ollama is running:**
+```powershell
+Invoke-RestMethod http://localhost:11434/api/tags
 ```
-Document input (PDF / DOCX / TXT)
-        │
-        ▼
-  [1] Document parser
-      Extracts clean text, preserves structure
-        │
-        ▼
-  [2] Claim extractor  (LLaMA 3.1 8B via Ollama)
-      Identifies specific ESG assertions
-        │
-        ▼
-  [3] Evidence retriever  (ChromaDB semantic search)
-      Finds supporting data/context for each claim
-        │
-        ▼
-  [4] Claim classifier  (ClimateBERT)
-      Maps claims to ESG framework categories
-        │
-        ▼
-  [5] Gap scorer  (LLaMA 3.1 8B via Ollama)
-      Reasons about substantiation quality
-        │
-        ▼
-  [6] Report generator
-      Structured JSON + human-readable summary
+You should see your model listed in the response.
+
+## Configuration
+
+Settings are managed in `backend/core/config.py` via environment variables or a `.env` file:
+
+```env
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=llama3.1:8b-instruct-q4_K_M
+OLLAMA_TIMEOUT_SECONDS=120
+CLAIM_EXTRACTION_CHUNK_SIZE=1500
+CLAIM_EXTRACTION_CHUNK_OVERLAP=200
 ```
 
----
+## Running Tests
+
+```powershell
+$env:PYTHONPATH = "C:\path\to\esgverify"; pytest tests/unit/ -v
+```
+
+Current test coverage:
+- `test_claim_extractor.py` — 18 tests, 18 passing
+  - JSON parsing (valid, malformed, markdown fences, missing keys)
+  - Claim conversion (valid, missing fields, unknown categories, unique IDs)
+  - End-to-end extraction (success, empty input, multi-chunk aggregation, retry/skip behavior)
+
+## Tech Stack
+
+| Component | Technology |
+|---|---|
+| LLM runtime | Ollama (local) |
+| LLM model | LLaMA 3.1 8B (q4_K_M) |
+| Backend framework | FastAPI |
+| Data validation | Pydantic v2 |
+| PDF parsing | PyMuPDF |
+| DOCX parsing | python-docx |
+| Vector store | ChromaDB |
+| HTTP client | httpx |
+| Retry logic | tenacity |
+| Logging | structlog |
+| Frontend | React + Vite (in progress) |
+
+## ESG Categories
+
+Claims are classified into four categories:
+
+- **ENVIRONMENTAL** — emissions, energy, water, waste, biodiversity, climate
+- **SOCIAL** — labor practices, supply chain, diversity, community
+- **GOVERNANCE** — board composition, executive pay, anti-corruption, transparency
+- **UNKNOWN** — claims that don't clearly fit the above
+
+## Supported Frameworks
+
+The LLM is prompted to tag claims against recognized ESG frameworks:
+GHG Protocol, TCFD, GRI, UN SDGs, CDP, SASB, EU Taxonomy, ISSB
+
+## Limitations
+
+- Only analyzes English-language documents
+- LLM output quality depends on document clarity and structure
+- Does not verify claims against external databases or registries
+- Does not determine regulatory compliance or legal liability
+- Claim extraction accuracy improves with longer, more structured documents
+
+## Intended Use
+
+ESGVerify is most relevant for sustainability professionals, ESG analysts, and researchers analyzing:
+
+- Corporate sustainability reports and annual disclosures
+- Marketing materials and product environmental claims
+- Press releases and investor communications
+- Public filings with environmental statements
+
+It is not suitable for legal proceedings, formal regulatory complaints, or academic research requiring rigorous reproducibility.
 
 ## Roadmap
 
-- [x] Repository scaffold and architecture design
-- [ ] Document parsing (PDF, DOCX, TXT)
-- [ ] Claim extraction pipeline
-- [ ] Evidence retrieval with ChromaDB
-- [ ] ClimateBERT claim classification
-- [ ] Gap scoring with Ollama
-- [ ] FastAPI backend with full route coverage
-- [ ] React frontend — document upload and results view
-- [ ] Export to PDF/CSV
-- [ ] GRI and TCFD framework mapping
-- [ ] Batch processing for multiple documents
-
----
-
-## Contributing
-
-Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
-
----
+- [x] Stage 1: Document ingestion (PDF, DOCX, TXT)
+- [x] Stage 2: LLM-powered claim extraction with structured output
+- [ ] Stage 3: Claim analysis — substantiation level and risk scoring
+- [ ] Stage 4: Evidence cross-referencing via ChromaDB
+- [ ] Stage 5: Report generation (PDF export)
+- [ ] Stage 6: React frontend with document upload and results dashboard
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.
 
----
+## Resources
 
-## Disclaimer
-
-ESGVerify is a research and awareness tool. Analysis results should not be used as the sole basis for investment, legal, or compliance decisions. Always consult qualified sustainability and legal professionals for formal assessments.
+- [EU Green Claims Directive](https://environment.ec.europa.eu/topics/circular-economy/green-claims_en)
+- [FTC Green Guides](https://www.ftc.gov/news-events/topics/truth-advertising/green-guides)
+- [GRI Standards](https://www.globalreporting.org/standards/)
+- [TCFD Recommendations](https://www.fsb-tcfd.org/recommendations/)
+- [Ollama Documentation](https://ollama.com/docs)

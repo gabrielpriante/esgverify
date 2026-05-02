@@ -10,6 +10,7 @@ Tests cover:
 
 from __future__ import annotations
 
+import httpx
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -99,7 +100,7 @@ class TestDictToExtractedClaim:
         claim = _dict_to_extracted_claim(raw, chunk)
         assert claim is not None
         assert claim.text == "We achieved carbon neutrality in 2023."
-        assert claim.esg_category == ESGCategory.environmental
+        assert claim.esg_category == ESGCategory.ENVIRONMENTAL
         assert "TCFD" in claim.framework_tags
         assert claim.page_reference == "p.12"
 
@@ -117,7 +118,7 @@ class TestDictToExtractedClaim:
         }
         claim = _dict_to_extracted_claim(raw, chunk)
         assert claim is not None
-        assert claim.esg_category == ESGCategory.unknown
+        assert claim.esg_category == ESGCategory.UNKNOWN
 
     def test_missing_framework_tags_defaults_to_empty_list(self) -> None:
         chunk = make_chunk()
@@ -179,8 +180,8 @@ async def test_extract_claims_success() -> None:
         claims = await extract_claims(chunks)
 
     assert len(claims) == 2
-    assert claims[0].esg_category == ESGCategory.environmental
-    assert claims[1].esg_category == ESGCategory.governance
+    assert claims[0].esg_category == ESGCategory.ENVIRONMENTAL
+    assert claims[1].esg_category == ESGCategory.GOVERNANCE
 
 
 @pytest.mark.asyncio
@@ -215,33 +216,29 @@ async def test_extract_claims_empty_chunks_returns_empty() -> None:
 
 @pytest.mark.asyncio
 async def test_extract_claims_retry_then_succeed() -> None:
-    """extract_claims succeeds after a transient failure on retry."""
-    import httpx
+    """extract_claims succeeds on a chunk when _call_ollama eventually returns."""
+    chunks = [make_chunk(index=0), make_chunk(index=1, text="Second chunk.")]
 
-    chunks = [make_chunk(index=0)]
-
-    # First call raises a timeout; second call succeeds
+    # First chunk fails (exhausts retries), second succeeds.
+    # This tests that extract_claims continues to the next chunk after a failure.
+    responses = [httpx.HTTPError("connection refused"), MOCK_VALID_RESPONSE]
     call_count = 0
 
-    async def flaky_ollama(prompt: str, chunk_index: int) -> str:
+    async def side_effect(prompt: str, chunk_index: int) -> str:
         nonlocal call_count
+        result = responses[call_count]
         call_count += 1
-        if call_count == 1:
-            raise httpx.TimeoutException("timeout")
-        return MOCK_VALID_RESPONSE
+        if isinstance(result, Exception):
+            raise result
+        return result
 
     with patch(
         "backend.core.pipeline.claim_extractor._call_ollama",
-        new=flaky_ollama,
+        new=side_effect,
     ):
-        # _call_ollama itself has the tenacity decorator, so we test the
-        # outer extract_claims behavior when _call_ollama exhausts retries.
-        # Here we simulate it by making the mock raise then succeed — in
-        # production tenacity wraps _call_ollama, not our mock, so we patch
-        # at the extract_claims level to verify the skip-on-failure path.
         claims = await extract_claims(chunks)
 
-    # call_count == 2 means the retry logic triggered internally
+    # Chunk 0 failed and was skipped; chunk 1 succeeded with 2 claims
     assert call_count == 2
     assert len(claims) == 2
 

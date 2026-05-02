@@ -219,7 +219,7 @@ def _dict_to_extracted_claim(raw_claim: dict[str, Any], chunk: TextChunk) -> Ext
                 chunk_index=chunk.index,
                 raw_category=raw_cat,
             )
-            category = ESGCategory.unknown
+            category = ESGCategory.UNKNOWN
 
         framework_tags: list[str] = []
         raw_tags = raw_claim.get("framework_tags", [])
