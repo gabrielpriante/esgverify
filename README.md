@@ -1,6 +1,6 @@
 # ESGVerify
 
-A local, LLM-powered ESG claim analysis tool for sustainability professionals. ESGVerify analyzes corporate documents: annual reports, sustainability disclosures, marketing materials — and determines whether environmental, social, and governance claims are actually substantiated by evidence in the document.
+A local, LLM-powered ESG claim analysis tool for sustainability professionals. ESGVerify analyzes corporate documents: annual reports, sustainability disclosures, marketing materials, and determines whether environmental, social, and governance claims are actually substantiated by evidence in the document.
 
 > **Disclaimer**: ESGVerify is designed to assist with early screening of ESG claims in corporate communications. It does not constitute legal advice, regulatory compliance assessment, or certification of any kind. For formal evaluation of environmental claims, consult qualified experts and verify against recognized standards.
 
