@@ -6,7 +6,7 @@ A local, LLM-powered ESG claim analysis tool for sustainability professionals. E
 
 ## What is Greenwashing?
 
-Greenwashing occurs when companies make misleading or unsubstantiated environmental claims about their products, services, or operations. Unlike simple keyword scanners, ESGVerify uses a local large language model to reason about whether claims are backed by concrete evidence — distinguishing between a company that says "we are carbon neutral" with third-party certification data and one that says the same thing with nothing to back it up.
+Greenwashing occurs when companies make misleading or unsubstantiated environmental claims about their products, services, or operations. Unlike simple keyword scanners, ESGVerify uses a local large language model to reason about whether claims are backed by concrete evidence distinguishing between a company that says "we are carbon neutral" with third-party certification data and one that says the same thing with nothing to back it up.
 
 ## Core Principle
 
