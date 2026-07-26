@@ -220,6 +220,22 @@ def _generate_key_findings(
     if strong:
         findings.append(f"{strong} claim{'s' if strong != 1 else ''} {'are' if strong != 1 else 'is'} well-substantiated.")
 
+    # Unsure claims — reported separately, never folded into weak/none.
+    #
+    # UNSURE was added to SubstantiationLevel on 07/25/2026 to match
+    # annotation_guideline_v1.md. Until now nothing counted it, so an
+    # undetermined claim was invisible in every summary. Counting it as
+    # unsubstantiated would be worse than silence: "we could not tell" is not
+    # a finding about the company, it is a finding about our own coverage.
+    unsure = sum(
+        1 for a in analyses if a.substantiation_level == SubstantiationLevel.UNSURE
+    )
+    if unsure:
+        findings.append(
+            f"{unsure} claim{'s' if unsure != 1 else ''} could not be assessed "
+            f"either way and {'require' if unsure != 1 else 'requires'} review."
+        )
+
     return findings[:5]
 
 

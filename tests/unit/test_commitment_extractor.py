@@ -435,7 +435,7 @@ class TestRecall:
 
     @pytest.mark.asyncio
     async def test_skipped_sentence_becomes_unsure_not_dropped(self):
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             # verdict for sentence 1 only; sentence 2 omitted entirely
             return verdicts_payload(
                 verdict(1, "no", rejection_reason="values_statement")
@@ -452,7 +452,7 @@ class TestRecall:
 
     @pytest.mark.asyncio
     async def test_past_action_returns_as_explicit_rejection(self):
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             if system_prompt == detect_text():
                 return verdicts_payload(
                     verdict(1, "yes"),
@@ -472,7 +472,7 @@ class TestRecall:
     @pytest.mark.asyncio
     async def test_record_text_comes_from_source_not_model_echo(self):
         """Guards against transcription drift and invented quotes."""
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             return verdicts_payload(
                 verdict(1, "no", rejection_reason="values_statement",
                         text="A SENTENCE THE MODEL MADE UP"),
@@ -488,7 +488,7 @@ class TestRecall:
 
     @pytest.mark.asyncio
     async def test_every_sentence_gets_a_record_even_when_model_returns_nothing(self):
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             return verdicts_payload()
 
         with patch("backend.core.pipeline.commitment_extractor._call_ollama",
@@ -514,7 +514,7 @@ class TestTwoStageFlow:
     async def test_chunk_with_no_judgeable_sentences_is_skipped(self):
         called = []
 
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             called.append(1)
             return verdicts_payload()
 
@@ -529,7 +529,7 @@ class TestTwoStageFlow:
     async def test_negatives_skip_enrichment(self):
         systems = []
 
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             systems.append(system_prompt)
             return verdicts_payload(
                 verdict(1, "no", rejection_reason="values_statement"),
@@ -545,7 +545,7 @@ class TestTwoStageFlow:
 
     @pytest.mark.asyncio
     async def test_negative_fields_are_not_applicable(self):
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             return verdicts_payload(
                 verdict(1, "no", rejection_reason="values_statement"),
                 verdict(2, "no", rejection_reason="past_action"),
@@ -562,7 +562,7 @@ class TestTwoStageFlow:
 
     @pytest.mark.asyncio
     async def test_positive_triggers_enrichment_and_merges_fields(self):
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             if system_prompt == detect_text():
                 return verdicts_payload(
                     verdict(1, "yes"),
@@ -582,7 +582,7 @@ class TestTwoStageFlow:
     @pytest.mark.asyncio
     async def test_enrichment_failure_degrades_to_unsure(self):
         """Keep the judgement we earned; don't invent the rest."""
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             if system_prompt == detect_text():
                 return verdicts_payload(
                     verdict(1, "yes"),
@@ -601,7 +601,7 @@ class TestTwoStageFlow:
 
     @pytest.mark.asyncio
     async def test_enrichment_garbage_degrades_to_unsure(self):
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             if system_prompt == detect_text():
                 return verdicts_payload(
                     verdict(1, "yes"),
@@ -617,7 +617,7 @@ class TestTwoStageFlow:
 
     @pytest.mark.asyncio
     async def test_failed_detection_skips_chunk_without_crashing(self):
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             raise httpx.TimeoutException("detect timed out")
 
         with patch("backend.core.pipeline.commitment_extractor._call_ollama",
@@ -630,7 +630,7 @@ class TestTwoStageFlow:
     async def test_enrich_calls_scale_with_positives_only(self):
         enrich_calls = []
 
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             if system_prompt == detect_text():
                 return verdicts_payload(
                     verdict(1, "yes"),
@@ -648,7 +648,7 @@ class TestTwoStageFlow:
 
     @pytest.mark.asyncio
     async def test_commitment_ids_are_unique(self):
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             return verdicts_payload(
                 verdict(1, "no", rejection_reason="past_action"),
                 verdict(2, "no", rejection_reason="past_action"),
@@ -662,7 +662,7 @@ class TestTwoStageFlow:
 
     @pytest.mark.asyncio
     async def test_page_reference_falls_back_to_chunk_index(self):
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             return verdicts_payload(
                 verdict(1, "no", rejection_reason="past_action"),
                 verdict(2, "no", rejection_reason="past_action"),
@@ -688,7 +688,7 @@ class TestVerifiabilityOnNonCommitments:
 
     @pytest.mark.asyncio
     async def test_rejection_gets_none_not_unsure(self):
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             return verdicts_payload(
                 verdict(1, "no", rejection_reason="values_statement"),
                 verdict(2, "no", rejection_reason="past_action"),
@@ -702,7 +702,7 @@ class TestVerifiabilityOnNonCommitments:
 
     @pytest.mark.asyncio
     async def test_rejection_logs_no_verifiability_warning(self, caplog):
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             return verdicts_payload(
                 verdict(1, "no", rejection_reason="values_statement"),
                 verdict(2, "no", rejection_reason="past_action"),
@@ -747,7 +747,7 @@ class TestConcurrency:
 
     @staticmethod
     def _responder(delay_by_chunk: dict[int, float] | None = None):
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             if delay_by_chunk:
                 await asyncio.sleep(delay_by_chunk.get(chunk_index, 0))
             if system_prompt == detect_text():
@@ -804,7 +804,7 @@ class TestConcurrency:
         in_flight = 0
         peak = 0
 
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             nonlocal in_flight, peak
             in_flight += 1
             peak = max(peak, in_flight)
@@ -826,7 +826,7 @@ class TestConcurrency:
 
         monkeypatch.setattr(ce, "CONCURRENCY", 4)
 
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             if chunk_index == 1:
                 raise httpx.TimeoutException("chunk 1 is unlucky")
             if system_prompt == detect_text():
@@ -850,7 +850,7 @@ class TestProvenance:
 
     @pytest.mark.asyncio
     async def test_every_record_carries_model_and_detect_prompt_id(self):
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             return verdicts_payload(
                 verdict(1, "no", rejection_reason="values_statement"),
                 verdict(2, "no", rejection_reason="past_action"),
@@ -866,7 +866,7 @@ class TestProvenance:
 
     @pytest.mark.asyncio
     async def test_enrich_prompt_id_only_on_enriched_records(self):
-        async def fake(prompt, chunk_index, system_prompt):
+        async def fake(prompt, chunk_index, system_prompt, num_predict=None):
             if system_prompt == detect_text():
                 return verdicts_payload(
                     verdict(1, "yes"),

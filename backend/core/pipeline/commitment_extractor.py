@@ -54,11 +54,26 @@ from backend.core.pipeline.prompts import (
 
 logger = structlog.get_logger(__name__)
 
-# Max output tokens per chunk. Commitment records are large (7 nested field
-# objects each, negatives included), so this is higher than the claim
-# extractor's 1024. It is the dominant cost driver for wall-clock time —
-# lower it if runs are timing out. Overridable via the runner's --num-predict.
-NUM_PREDICT = 2048
+# Max output tokens, PER STAGE. Generation length is the dominant cost at
+# ~13 tok/s, and the two stages have very different output sizes:
+#
+#   detect  a list of {id, decision, reason, restated, is_evidence} objects.
+#           25 sentences of verdicts fits comfortably in ~800 tokens.
+#   enrich  one object: six status/value fields plus three scalars. ~500.
+#
+# Both were 2048, which cost generation time neither stage could use. Raising
+# these is safe; lowering them risks truncation mid-JSON, which parses as a
+# failure and degrades the record to unsure.
+#
+# Note these cap OUTPUT only. They are unrelated to num_ctx, and unrelated to
+# OLLAMA_NUM_PARALLEL — which divides the context between slots and will
+# silently reproduce the word-salad failure if set above 1 on a small card.
+DETECT_NUM_PREDICT = 800
+ENRICH_NUM_PREDICT = 500
+
+# When set, overrides both stages. Exists so a baseline run can reproduce the
+# old single-cap behaviour for a like-for-like comparison.
+NUM_PREDICT: int | None = None
 
 # Context window, set EXPLICITLY. Ollama's default num_ctx is small (2048 on
 # many setups). This prompt needs roughly:
@@ -222,7 +237,12 @@ def _number_sentences(sentences: list[str]) -> str:
     wait=wait_exponential(multiplier=1, min=2, max=10),
     reraise=True,
 )
-async def _call_ollama(prompt: str, chunk_index: int, system_prompt: str) -> str:
+async def _call_ollama(
+    prompt: str,
+    chunk_index: int,
+    system_prompt: str,
+    num_predict: int = DETECT_NUM_PREDICT,
+) -> str:
     """Send a prompt to Ollama and return the raw response text.
 
     Retries up to 3 times with exponential backoff on network or timeout
@@ -253,7 +273,7 @@ async def _call_ollama(prompt: str, chunk_index: int, system_prompt: str) -> str
         "options": {
             # Temperature 0 — deterministic structured output for a benchmark
             "temperature": 0,
-            "num_predict": NUM_PREDICT,
+            "num_predict": NUM_PREDICT if NUM_PREDICT else num_predict,
             "num_ctx": NUM_CTX,
         },
     }
@@ -548,7 +568,9 @@ async def _enrich(
     )
 
     try:
-        raw = await _call_ollama(prompt, chunk.index, enrich_prompt)
+        raw = await _guarded_call(
+            prompt, chunk.index, enrich_prompt, ENRICH_NUM_PREDICT
+        )
     except (httpx.HTTPError, httpx.TimeoutException) as exc:
         logger.warning(
             "enrich_call_failed",
@@ -690,12 +712,17 @@ def _parse_verdicts_json(
 # ---------------------------------------------------------------------------
 
 
-async def _guarded_call(prompt: str, chunk_index: int, system_prompt: str) -> str:
+async def _guarded_call(
+    prompt: str,
+    chunk_index: int,
+    system_prompt: str,
+    num_predict: int,
+) -> str:
     """Issue one model call, bounded by the module semaphore."""
     if _semaphore is None:          # direct call outside extract_commitments
-        return await _call_ollama(prompt, chunk_index, system_prompt)
+        return await _call_ollama(prompt, chunk_index, system_prompt, num_predict)
     async with _semaphore:
-        return await _call_ollama(prompt, chunk_index, system_prompt)
+        return await _call_ollama(prompt, chunk_index, system_prompt, num_predict)
 
 
 async def _process_chunk(
@@ -722,7 +749,9 @@ async def _process_chunk(
     detect_user = _DETECT_USER_TEMPLATE.format(numbered=_number_sentences(sentences))
 
     try:
-        raw_response = await _guarded_call(detect_user, chunk.index, detect_prompt)
+        raw_response = await _guarded_call(
+            detect_user, chunk.index, detect_prompt, DETECT_NUM_PREDICT
+        )
     except (httpx.HTTPError, httpx.TimeoutException) as exc:
         # str() on httpx timeout exceptions is often empty — use repr so the
         # log says which failure it was instead of "error=".
@@ -857,6 +886,8 @@ async def extract_commitments(chunks: list[TextChunk]) -> list[ExtractedCommitme
         enrich_prompt=enrich_id,
         chunks=len(chunks),
         concurrency=CONCURRENCY,
+        detect_num_predict=NUM_PREDICT or DETECT_NUM_PREDICT,
+        enrich_num_predict=NUM_PREDICT or ENRICH_NUM_PREDICT,
     )
 
     _semaphore = asyncio.Semaphore(CONCURRENCY)

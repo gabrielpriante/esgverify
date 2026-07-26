@@ -66,7 +66,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--num-predict", type=int, default=None,
-        help="Override max output tokens per chunk (default 2048). Lower is faster.",
+        help=(
+            "Override BOTH stages' output cap with one value. Use "
+            "--num-predict 2048 to reproduce the old single-cap behaviour for "
+            "a baseline comparison."
+        ),
+    )
+    parser.add_argument(
+        "--detect-num-predict", type=int, default=None,
+        help="Output cap for stage 1 detection (default 800)",
+    )
+    parser.add_argument(
+        "--enrich-num-predict", type=int, default=None,
+        help="Output cap for stage 2 enrichment (default 500)",
     )
     parser.add_argument(
         "--num-ctx", type=int, default=None,
@@ -106,6 +118,10 @@ async def main() -> int:
     from backend.core.pipeline import commitment_extractor
     if args.num_predict is not None:
         commitment_extractor.NUM_PREDICT = args.num_predict
+    if args.detect_num_predict is not None:
+        commitment_extractor.DETECT_NUM_PREDICT = args.detect_num_predict
+    if args.enrich_num_predict is not None:
+        commitment_extractor.ENRICH_NUM_PREDICT = args.enrich_num_predict
     if args.num_ctx is not None:
         commitment_extractor.NUM_CTX = args.num_ctx
     if args.dump_raw:
@@ -116,8 +132,11 @@ async def main() -> int:
     print(f"Model:   {settings.ollama_model}")
     print(f"Ollama:  {settings.ollama_base_url}")
     print(f"Timeout: {settings.ollama_timeout_seconds}s per request")
-    print(f"Context: num_ctx={commitment_extractor.NUM_CTX}, "
-          f"num_predict={commitment_extractor.NUM_PREDICT}")
+    _override = commitment_extractor.NUM_PREDICT
+    print(f"Context: num_ctx={commitment_extractor.NUM_CTX}")
+    print(f"Output:  detect={_override or commitment_extractor.DETECT_NUM_PREDICT}, "
+          f"enrich={_override or commitment_extractor.ENRICH_NUM_PREDICT} tokens"
+          + ("  (single-cap override)" if _override else ""))
     print(f"Parallel:{commitment_extractor.CONCURRENCY} requests in flight")
     print(f"PDF:     {pdf_path.name}")
 
