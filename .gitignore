@@ -24,6 +24,12 @@ data/uploads/
 *.pdf
 *.docx
 
+# Extraction run outputs — regenerable, and large. Keep the directories
+# tracked (via .gitkeep) so a fresh clone has somewhere to write.
+data/samples/*.json
+data/samples/raw/
+!data/samples/.gitkeep
+
 # Node
 node_modules/
 frontend/dist/

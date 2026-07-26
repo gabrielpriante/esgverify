@@ -1,9 +1,0 @@
-{
-  "source_pdf": "The-2023-Impact-Summary.pdf",
-  "model": "llama3.1:8b-instruct-q4_K_M",
-  "pages": 31,
-  "chunks_total": 55,
-  "chunks_processed": 5,
-  "elapsed_seconds": 1824.5,
-  "records": []
-}
