@@ -1,251 +1,298 @@
 # ESGVerify
 
-A local, LLM-powered ESG claim analysis tool for sustainability professionals. ESGVerify analyzes corporate documents: annual reports, sustainability disclosures, marketing materials, and determines whether environmental, social, and governance claims are actually substantiated by evidence in the document.
+**The extraction pipeline behind a research benchmark for environmental commitment extraction and verifiability scoring from corporate sustainability reports.**
 
-> **Disclaimer**: ESGVerify is designed to assist with early screening of ESG claims in corporate communications. It does not constitute legal advice, regulatory compliance assessment, or certification of any kind. For formal evaluation of environmental claims, consult qualified experts and verify against recognized standards.
+ESGVerify reads a sustainability report and answers two questions about every sentence in it: *is this a pledge to a future environmental action or outcome?* and, if so, *what is its structure and how well is it evidenced within the document?*
 
-## What is Greenwashing?
+It began as a greenwashing-screening tool. It is now the instrument for a benchmark paper, and this README describes what it actually is rather than what it was.
 
-Greenwashing occurs when companies make misleading or unsubstantiated environmental claims about their products, services, or operations. Unlike simple keyword scanners, ESGVerify uses a local large language model to reason about whether claims are backed by concrete evidence distinguishing between a company that says "we are carbon neutral" with third-party certification data and one that says the same thing with nothing to back it up.
+**Everything runs locally. No data leaves your machine.** ESGVerify uses Ollama to run an 8B model on your own hardware — no external APIs, no subscriptions. This started as a privacy feature and has become a research argument: the organizations that hold the most interesting sustainability documents are often contractually or legally unable to send them to a commercial API. A benchmark that only works via hosted inference cannot be run by the people with the data.
 
-## Core Principle
+> **Disclaimer**: ESGVerify assists with the extraction and structuring of environmental commitments. It does not constitute legal advice, regulatory compliance assessment, or certification. Its outputs are model predictions, not findings about any company.
 
-**Everything runs locally. No data leaves your machine.** ESGVerify uses Ollama to run LLaMA 3.1 8B on your hardware. No external APIs, no subscriptions, no data privacy concerns.
+---
 
-## Project Structure
+## The task
 
-```
-esgverify/
-│
-├── backend/
-│   ├── main.py                         # FastAPI app entry point
-│   ├── api/
-│   │   └── routes/
-│   │       ├── analysis.py             # POST /api/v1/analyze
-│   │       └── health.py               # GET /api/v1/health
-│   ├── core/
-│   │   ├── config.py                   # Settings (Ollama URL, model, chunk sizes)
-│   │   ├── models/
-│   │   │   └── report.py               # Pydantic models: ExtractedClaim, ClaimAnalysis, etc.
-│   │   └── pipeline/
-│   │       ├── orchestrator.py         # Pipeline coordinator (4 stages complete)
-│   │       ├── chunker.py              # Document text → overlapping chunks
-│   │       ├── claim_extractor.py      # Chunks → structured ESG claims via LLM
-│   │       ├── claim_analyzer.py       # Claims → substantiation level + risk scoring
-│   │       └── evidence_retriever.py   # Claims → supporting evidence via ChromaDB
-│   ├── services/                       # Business logic layer
-│   └── utils/
-│       └── document_parser.py          # PDF, DOCX, TXT text extraction
-│
-├── tests/
-│   └── unit/
-│       ├── test_claim_extractor.py     # 18 tests, 18 passing
-│       ├── test_claim_analyzer.py      # 27 tests, 27 passing
-│       └── test_evidence_retriever.py  # 26 tests, 26 passing
-│
-├── requirements.txt
-└── README.md
-```
+An **environmental commitment** is a stated intention, in writing, to take a future environmental action or reach a future environmental outcome. Future intention is the core test: if a sentence does not point forward in time, it is not a commitment however environmental it sounds.
 
-## How It Works
+What is promised must be *specific*. "We are committed to achieving net zero emissions across our value chain" is a commitment even with no date and no number. "We are committed to meeting our own goals" is not — the promised thing is generic.
 
-ESGVerify processes documents through a multi-stage pipeline:
+Four categories are excluded, and each is recorded with its reason rather than silently dropped:
 
-**Stage 1 — Document Ingestion** ✅ Complete: Accepts PDF, DOCX, and TXT files. Extracts raw text using PyMuPDF and python-docx.
-
-**Stage 2 — Claim Extraction** ✅ Complete: Splits document text into overlapping chunks that respect sentence and paragraph boundaries, then sends each chunk to a local LLM (LLaMA 3.1 8B via Ollama). The model identifies ESG claims and returns them as structured JSON — text, context, ESG category (Environmental / Social / Governance), and relevant framework tags (GHG Protocol, TCFD, GRI, UN SDGs, etc.).
-
-**Stage 3 — Claim Analysis** ✅ Complete: Each extracted claim is sent back to the LLM for substantiation scoring. Returns a `SubstantiationLevel` (strong / moderate / weak / none), a `RiskLevel` (high / medium / low), a `gap_explanation` describing what evidence is missing, and a `confidence` score.
-
-**Stage 4 — Evidence Retrieval** ✅ Complete: Embeds document chunks into ChromaDB using `all-MiniLM-L6-v2` and performs cosine similarity search for each claim. Returns up to 5 supporting passages per claim with relevance scores and automatically classified evidence types (certification, third_party_reference, data, methodology).
-
-**Stage 5 — React Frontend** — In progress.
-
-**Stage 6 — Report Export (PDF)** — Planned.
-
-## Verified Results
-
-Analyzed the Microsoft 2023 Impact Summary (22MB PDF, 69,896 characters):
-
-| Metric | Value |
+| Rejection | Example |
 |---|---|
-| Total claims identified | 141 |
-| High greenwashing risk | 86 (61%) |
-| Strong substantiation | 25 (18%) |
-| Weak or no substantiation | 87 (62%) |
-| Overall risk level | HIGH |
-| Evidence passages retrieved | 690 |
+| `past_action` | "In 2023 we reduced water use by 12%." |
+| `values_statement` | "Sustainability is at the heart of everything we do." |
+| `factual_disclosure` | A fact carrying no promise. |
+| `description` | A product, process or organization as it currently exists. |
 
-Most claims related to Environmental (64), followed by Social (60) and Governance (12).
+Three rulings that recur, locked in the annotation guideline:
+
+- **Conditional commitments count.** "Subject to government policy, we intend to electrify our fleet by 2035" is a commitment; the caveat is recorded in a field, never used to exclude.
+- **Restated commitments count**, carrying a `restated` flag so repeat disclosure can be filtered and does not inflate counts.
+- **Third-party validation is evidence, not a commitment.** "Our targets were validated by SBTi" describes verification of a pledge made elsewhere.
+
+The annotation unit is the **sentence**. Span-level annotation is future work.
+
+---
+
+## What the pipeline does
+
+Two stages, deliberately split.
+
+**Sentence splitting happens locally, before any model call.** Chunk text is split into sentences, hard-wrapped PDF lines are rejoined, navigation furniture ("Overview", "Learn more") is dropped, and the remaining sentences are numbered.
+
+**Stage 1 — detection.** The numbered sentences go to the model, which must return exactly one verdict per id: `yes` / `no` / `unsure`, plus a rejection reason, a `restated` flag and an `is_evidence` flag.
+
+Numbering exists for two reasons. An earlier version asked the model to find and quote commitment sentences itself, and it silently omitted inconvenient ones — including a past-action sentence that should have been an explicit rejection. Numbering makes an omission *detectable*: any id that comes back missing is recorded as `unsure` with a note rather than vanishing. It also means **record text is taken from the source document by id, never from the model's echo**, so a record can never contain a sentence the model paraphrased or invented.
+
+**Stage 2 — enrichment.** Each sentence judged `yes` goes back on its own, and the model fills seven structural fields:
+
+| Field | Meaning |
+|---|---|
+| `target` | what is promised |
+| `quantity` | how much |
+| `deadline` | by when |
+| `baseline` | starting point |
+| `business_unit` | what part of the business |
+| `emissions_scope` | what part of emissions (Scope 1/2/3) |
+| `depends_on_outside_factors` | conditional on policy, infrastructure, third parties |
+
+Every field carries a **status**, and a value only when `stated`:
+
+`stated` · `not_stated` (the document is silent) · `not_applicable` (cannot apply here) · `unsure` (cannot tell)
+
+These are kept distinct on purpose. Collapsing them into a null throws away the difference between a company that omitted a deadline and an annotator who could not find one.
+
+Rejected sentences skip stage 2 entirely — their structural fields are `not_applicable` and their verifiability is null, because a sentence that is not a pledge has nothing to verify.
+
+**Verifiability** is a five-level scale, judged **within the document only**:
+
+| Level | Meaning |
+|---|---|
+| `strong` | specific data, checkable datasets, third-party verification |
+| `moderate` | partial supporting evidence, gaps remain |
+| `weak` | thin supporting evidence exists |
+| `none` | zero corroborating evidence anywhere in the document |
+| `unsure` | cannot determine either way |
+
+The `weak` / `none` boundary is about the **presence** of evidence, not the specificity of the commitment. A vague pledge with some supporting context is `weak`, not `none`.
+
+External verification — checking a certification body or regulatory registry — is out of scope for v1 and recorded as a limitation.
+
+The commitment judgement is recorded **independently of ESG category**. A sentence can be environmental without being a commitment, and the two are separate fields.
+
+---
+
+## Provenance and reproducibility
+
+This is a benchmark, so being able to reproduce a result matters more than any individual number.
+
+**Prompts are versioned files, not string literals.** They live in `scripts/prompts/` and are published with the paper:
+
+```
+scripts/prompts/detect_v2.txt     stage 1
+scripts/prompts/enrich_v1.txt     stage 2
+```
+
+**Every record carries its own provenance** — not the run, the record:
+
+```json
+{
+  "model": "llama3.1:8b-instruct-q4_K_M",
+  "detect_prompt_id": "detect_v2.txt@98921feba4f9",
+  "enrich_prompt_id": "enrich_v1.txt@5709496bf0d7"
+}
+```
+
+The identifier is `filename@sha256[:12]` of the prompt file's contents. A hash of an inline string would change silently whenever the module was edited; a hash of a file changes only when the prompt changes. A prompt over the token budget is refused at load time rather than silently degrading output.
+
+`scripts/compare_runs.py` diffs two result files record by record and exits non-zero on any divergence. It also refuses to compare a degenerate run — one where every record is `unsure` because no model response parsed. That failure mode passed a green unit-test suite once; it does not pass this.
+
+---
+
+## The walling-off rule
+
+**`llama3.1:8b-instruct-q4_K_M` is the annotation-assist model. It is excluded from evaluation, permanently.**
+
+The benchmark measures how well language models extract commitments. The same model cannot both help produce the gold labels and be scored against them — its "accuracy" would partly measure agreement with itself. That is circular evaluation, and it invalidates the result.
+
+Models under test are drawn from a disjoint set (Mistral, Qwen, Gemma, larger Llama variants). The annotation-assist model never appears among them.
+
+The human annotator is the final authority on gold labels. The LLM is a second annotator whose disagreements are adjudicated by hand and logged.
+
+---
+
+## Known limitations
+
+**Temporal confusion in the annotation-assist model.** It accepts some past-tense sentences as commitments. On chunk 39 of the development document, 4 sentences were judged commitments and 2 of those were wrong — one past-action sentence and one vague aspiration, both of which appear in the detection prompt as explicit counter-examples.
+
+**This is not being engineered away, and that is a deliberate methodological choice.** Adding machinery to correct errors observed against our own development-set labels would fit the annotator to the gold standard and raise inter-annotator agreement for reasons unrelated to model quality. It would also scaffold away the very behaviour the failure taxonomy exists to measure. Temporal errors are corrected during hand adjudication, logged in the disagreement log, and reported as a finding about model behaviour.
+
+A deterministic past-tense filter was considered and rejected more firmly still: it would hard-code the annotator's bias into the gold labels, and a reviewer could not tell whether the benchmark measures the models or measures the regex.
+
+Other limitations:
+
+- English-language documents only.
+- Evidence scope is within-document; no external registry or certification checks.
+- Throughput is bounded by local inference. On a single 8 GB card at ~13 tok/s, a 136-page report takes hours, not minutes.
+- **Do not set `OLLAMA_NUM_PARALLEL` above 1 on a small card.** It divides the context window between slots, silently truncating the prompt and producing degenerate output that looks like a broken model.
+- Model output quality depends on document structure; PDF text extraction from design-heavy reports is imperfect.
+
+---
+
+## Current status
+
+**Section 5 complete** — pipeline built and tagged `v0.1.0-benchmark` as the paper's reference version.
+
+**Corpus assembled** — 155 sustainability reports, 20 companies, 2015–2025, oil & gas and electric utilities. Two further documents (Microsoft 2023 Impact Summary, J&J Health for Humanity 2025) are held separately as guideline-development documents and are **not** part of the corpus frame; the annotation guideline was built on them, so including them would mean reporting results on documents the instrument was fitted to.
+
+**Next** — gold-standard annotation on a sampled subset (~20–30 documents), with the LLM as independent second annotator against hand labels, then model evaluation and a failure taxonomy.
+
+The original greenwashing pipeline (`claim_extractor`, `claim_analyzer`, `evidence_retriever`, ChromaDB retrieval) remains in the codebase and shares the verifiability scale. It supports a separate follow-on paper and is not part of the benchmark.
+
+---
 
 ## Requirements
 
 - Python 3.13+
 - [Ollama](https://ollama.com/download) installed and running locally
-- 8GB+ VRAM recommended (the default model uses ~4.7GB)
+- 8 GB+ VRAM recommended (the model uses ~4.9 GB, plus KV cache at 8192 context)
 - Windows, macOS, or Linux
 
 ## Installation
 
-**1. Clone the repository:**
 ```bash
 git clone https://github.com/gabrielpriante/esgverify.git
 cd esgverify
+pip install -r backend/requirements.txt
 ```
 
-**2. Install dependencies:**
+> **Note:** Python 3.13 requires `torch==2.6.0` and `torchvision==0.21.0` specifically. Other versions break `sentence-transformers`, which the evidence-retrieval path depends on.
+
+Pull the annotation-assist model:
+
 ```bash
-pip install -r requirements.txt
+ollama pull llama3.1:8b-instruct-q4_K_M
 ```
 
-> **Note:** Python 3.13 requires `torch==2.6.0` and `torchvision==0.21.0` specifically. Other versions will break `sentence-transformers`. If you encounter import errors, run: `pip install torch==2.6.0 torchvision==0.21.0`
-
-**3. Install and start Ollama:**
-
-Download from [ollama.com/download](https://ollama.com/download), then pull the model:
-```bash
-ollama pull llama3.1:8b
-```
-
-**4. Verify Ollama is running:**
-```powershell
-Invoke-RestMethod http://localhost:11434/api/tags
-```
-
-## Running the Server
-
-Open two terminals:
-
-**Terminal 1 — Start Ollama:**
-```bash
-ollama run llama3.1:8b
-```
-
-**Terminal 2 — Start the API server:**
-```powershell
-$env:PYTHONPATH = "C:\path\to\esgverify"; uvicorn backend.main:app --reload
-```
-
-Swagger UI is available at `http://127.0.0.1:8000/docs`.
-
-## Submitting a Document (PowerShell)
+Verify Ollama is up:
 
 ```powershell
-$env:PYTHONPATH = "C:\path\to\esgverify"
-$filePath = "C:\path\to\your\document.pdf"
-$fileBytes = [System.IO.File]::ReadAllBytes($filePath)
-$boundary = [System.Guid]::NewGuid().ToString()
-$body = "--$boundary`r`nContent-Disposition: form-data; name=`"file`"; filename=`"document.pdf`"`r`nContent-Type: application/pdf`r`n`r`n" + [System.Text.Encoding]::GetEncoding("iso-8859-1").GetString($fileBytes) + "`r`n--$boundary--"
-$response = Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/v1/analyze" -Method POST -ContentType "multipart/form-data; boundary=$boundary" -Body $body -TimeoutSec 3600
-$response | ConvertTo-Json -Depth 20 | Out-File "report.json"
+ollama list
 ```
 
-> **Note:** Processing takes approximately 25 minutes for a 70k character document due to sequential LLM calls (~290 total for extraction + analysis).
+## Running the extractor
+
+The entry point is the commitment extractor. Output is auto-named `<document>_<YYYY-MM-DD>.json`:
+
+```powershell
+python scripts/run_commitment_extraction.py --pdf "path\to\report.pdf" --model llama3.1:8b-instruct-q4_K_M --timeout 900
+```
+
+Useful flags:
+
+| Flag | Purpose |
+|---|---|
+| `--start N --limit N` | process a chunk range — start small on a new document |
+| `--out PATH` | explicit output path instead of auto-naming |
+| `--out-dir DIR` | directory for auto-named output (default `data/samples`) |
+| `--dump-raw DIR` | write every raw model response before parsing, for debugging |
+| `--concurrency N` | requests in flight; **leave at 1** on a single small GPU |
+| `--num-ctx N` | context window (default 8192) |
+
+Batch across a corpus, resumable across sessions:
+
+```powershell
+python scripts/run_corpus_batch.py --dry-run          # list what would run
+python scripts/run_corpus_batch.py --limit-docs 1     # prove it on one document
+python scripts/run_corpus_batch.py 2>&1 | Tee-Object -FilePath logs\corpus_batch.log
+```
+
+A document whose output already exists is skipped, so a restart never redoes or overwrites completed work. Failures are logged and the batch continues.
+
+Compare two runs:
+
+```powershell
+python scripts/compare_runs.py data\samples\before.json data\samples\after.json
+```
 
 ## Configuration
 
-Settings are managed in `backend/core/config.py` via environment variables or a `.env` file:
+`backend/core/config.py`, via environment variables or `.env`:
 
 ```env
 OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=llama3.1:8b
-OLLAMA_TIMEOUT_SECONDS=120
+OLLAMA_MODEL=llama3.1:8b-instruct-q4_K_M
+OLLAMA_TIMEOUT_SECONDS=900
 CLAIM_EXTRACTION_CHUNK_SIZE=1500
 CLAIM_EXTRACTION_CHUNK_OVERLAP=200
+MAX_CONCURRENT_REQUESTS=1
 ```
 
-## Running Tests
+## Running tests
 
 ```powershell
 $env:PYTHONPATH = "C:\path\to\esgverify"; pytest tests/unit/ -v
 ```
 
-Current test coverage: **71 tests, 71 passing**
+**168 tests.**
 
-| File | Tests | Status |
+| File | Tests | Covers |
 |---|---|---|
-| `test_claim_extractor.py` | 18 | ✅ Passing |
-| `test_claim_analyzer.py` | 27 | ✅ Passing |
-| `test_evidence_retriever.py` | 26 | ✅ Passing |
+| `test_commitment_extractor.py` | 89 | rulings, field distinctness, recall, two-stage flow, provenance, prompt guards |
+| `test_claim_analyzer.py` | 27 | legacy claim path |
+| `test_evidence_retriever.py` | 26 | legacy retrieval path |
+| `test_claim_extractor.py` | 18 | legacy claim path |
+| `test_orchestrator.py` | 9 | summary generation, UNSURE counting |
 
-## Tech Stack
+These are **offline**; every model call is mocked. They prove the pipeline handles model output correctly. They cannot prove the model behaves correctly on a real document — that requires a live run, and a green suite has masked a broken pipeline at least once here.
+
+## Project structure
+
+```
+esgverify/
+├── backend/core/
+│   ├── models/report.py                  ExtractedCommitment, StructuredField, enums
+│   └── pipeline/
+│       ├── chunker.py                    text -> overlapping chunks
+│       ├── commitment_extractor.py       two-stage extraction  [benchmark]
+│       ├── prompts.py                    prompt loading + content hashing
+│       ├── claim_extractor.py            legacy ESG claim path
+│       ├── claim_analyzer.py             legacy substantiation scoring
+│       ├── evidence_retriever.py         legacy ChromaDB retrieval
+│       └── orchestrator.py               legacy pipeline coordinator
+├── scripts/
+│   ├── prompts/                          versioned prompt files (published)
+│   ├── run_commitment_extraction.py      single document
+│   ├── run_corpus_batch.py               resumable corpus pass
+│   ├── compare_runs.py                   record-by-record equivalence gate
+│   └── diagnose_ollama_prompt.py         prompt/context bisection tool
+└── tests/unit/
+```
+
+## Tech stack
 
 | Component | Technology |
 |---|---|
 | LLM runtime | Ollama (local) |
-| LLM model | LLaMA 3.1 8B |
-| Backend framework | FastAPI |
+| Annotation-assist model | llama3.1:8b-instruct-q4_K_M |
 | Data validation | Pydantic v2 |
 | PDF parsing | PyMuPDF |
-| DOCX parsing | python-docx |
-| Vector store | ChromaDB |
-| Embeddings | sentence-transformers (all-MiniLM-L6-v2) |
 | HTTP client | httpx |
 | Retry logic | tenacity |
 | Logging | structlog |
-| Frontend | React + Vite (in progress) |
-
-## ESG Categories
-
-Claims are classified into four categories:
-
-- **ENVIRONMENTAL** — emissions, energy, water, waste, biodiversity, climate
-- **SOCIAL** — labor practices, supply chain, diversity, community
-- **GOVERNANCE** — board composition, executive pay, anti-corruption, transparency
-- **UNKNOWN** — claims that don't clearly fit the above
-
-## Substantiation Levels
-
-| Level | Description |
-|---|---|
-| **strong** | Claim is backed by specific data, certifications, or third-party verification |
-| **moderate** | Claim has partial supporting evidence but gaps remain |
-| **weak** | Claim has minimal support; mostly aspirational language |
-| **none** | No evidence found in the document to support the claim |
-
-## Supported Frameworks
-
-The LLM is prompted to tag claims against recognized ESG frameworks:
-GHG Protocol, TCFD, GRI, UN SDGs, CDP, SASB, EU Taxonomy, ISSB
-
-## Known Limitations
-
-- Only analyzes English-language documents
-- Sequential LLM calls result in ~25 minute processing time for typical documents
-- LLM output quality depends on document clarity and structure
-- Does not verify claims against external databases or registries
-- Does not determine regulatory compliance or legal liability
-- Claim extraction accuracy improves with longer, more structured documents
-
-## Intended Use
-
-ESGVerify is most relevant for sustainability professionals, ESG analysts, and researchers analyzing:
-
-- Corporate sustainability reports and annual disclosures
-- Marketing materials and product environmental claims
-- Press releases and investor communications
-- Public filings with environmental statements
-
-It is not suitable for legal proceedings, formal regulatory complaints, or academic research requiring rigorous reproducibility.
-
-## Roadmap
-
-- [x] Stage 1: Document ingestion (PDF, DOCX, TXT)
-- [x] Stage 2: LLM-powered claim extraction with structured output
-- [x] Stage 3: Claim analysis — substantiation level and risk scoring
-- [x] Stage 4: Evidence cross-referencing via ChromaDB
-- [ ] Stage 5: React + Vite frontend with document upload and results dashboard
-- [ ] Stage 6: Report generation (PDF export)
-- [ ] Performance: Async/concurrent LLM calls to reduce processing time
+| Vector store (legacy path) | ChromaDB + all-MiniLM-L6-v2 |
+| API (legacy path) | FastAPI |
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE).
 
 ## Resources
 
-- [EU Green Claims Directive](https://environment.ec.europa.eu/topics/circular-economy/green-claims_en)
-- [FTC Green Guides](https://www.ftc.gov/news-events/topics/truth-advertising/green-guides)
 - [GRI Standards](https://www.globalreporting.org/standards/)
 - [TCFD Recommendations](https://www.fsb-tcfd.org/recommendations/)
+- [EU Green Claims Directive](https://environment.ec.europa.eu/topics/circular-economy/green-claims_en)
 - [Ollama Documentation](https://ollama.com/docs)
