@@ -313,12 +313,14 @@ class ExtractedCommitment(BaseModel):
     )
 
     # --- Verifiability ------------------------------------------------------
-    verifiability: SubstantiationLevel = Field(
-        default=SubstantiationLevel.UNSURE,
+    verifiability: Optional[SubstantiationLevel] = Field(
+        default=None,
         description=(
-            "Five-level scale shared with the claim path. Evidence scope for "
-            "v1 is within-document only; external verification is out of scope "
-            "and recorded as a limitation."
+            "Five-level scale shared with the claim path. None means the "
+            "question does not arise because this record is not a commitment "
+            "— distinct from UNSURE, which means we looked and could not tell. "
+            "Evidence scope for v1 is within-document only; external "
+            "verification is out of scope and recorded as a limitation."
         ),
     )
     annotator_notes: Optional[str] = Field(

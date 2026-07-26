@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     claim_extraction_chunk_size: int = 1500   # characters per chunk sent to LLM
     claim_extraction_chunk_overlap: int = 200  # overlap between chunks
 
+    # Max Ollama requests in flight at once. Bounds the client only — Ollama
+    # serialises per loaded model unless OLLAMA_NUM_PARALLEL is also raised.
+    max_concurrent_requests: int = 4
+
 
 # Single shared instance imported throughout the app
 settings = Settings()

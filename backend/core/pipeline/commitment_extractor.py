@@ -22,6 +22,7 @@ Recommended model: ``llama3.1:8b-instruct-q4_K_M``
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import uuid
@@ -109,6 +110,18 @@ MIN_SENTENCE_CHARS = 25
 
 # Cap on sentences per detection call, to keep the user turn bounded.
 MAX_SENTENCES_PER_CALL = 25
+
+# How many Ollama requests may be in flight at once. Chunks are processed
+# concurrently and enrichment calls within a chunk are issued together; this
+# semaphore is the only thing bounding total load.
+#
+# NOTE: this bounds the CLIENT. Ollama itself serialises requests per loaded
+# model unless OLLAMA_NUM_PARALLEL is raised, so concurrency above that value
+# only queues work rather than speeding it up. Set both, and keep an eye on
+# VRAM: each parallel slot needs its own KV cache at num_ctx.
+CONCURRENCY = settings.max_concurrent_requests
+
+_semaphore: asyncio.Semaphore | None = None
 
 _DETECT_USER_TEMPLATE = """\
 Judge each numbered sentence. Return exactly one verdict per id.
@@ -433,16 +446,31 @@ def _dict_to_commitment(
             )
             decision = CommitmentDecision.UNSURE
 
+        # Verifiability only arises for commitments. A rejected sentence has
+        # nothing to verify, so an absent level is expected and silent — it is
+        # recorded as None, distinct from UNSURE ("we looked, we can't tell").
+        # Warning on every rejection buried the real warnings under thousands
+        # of spurious ones across a corpus.
         raw_verifiability = str(raw.get("verifiability", "")).lower().strip()
-        try:
-            verifiability = SubstantiationLevel(raw_verifiability)
-        except ValueError:
-            logger.warning(
-                "unknown_verifiability_level",
-                chunk_index=chunk.index,
-                raw_level=raw_verifiability,
-            )
-            verifiability = SubstantiationLevel.UNSURE
+        verifiability: SubstantiationLevel | None
+        if not raw_verifiability:
+            if decision is CommitmentDecision.YES:
+                logger.warning(
+                    "verifiability_missing_on_commitment", chunk_index=chunk.index
+                )
+                verifiability = SubstantiationLevel.UNSURE
+            else:
+                verifiability = None
+        else:
+            try:
+                verifiability = SubstantiationLevel(raw_verifiability)
+            except ValueError:
+                logger.warning(
+                    "unknown_verifiability_level",
+                    chunk_index=chunk.index,
+                    raw_level=raw_verifiability,
+                )
+                verifiability = SubstantiationLevel.UNSURE
 
         rejection_reason = raw.get("rejection_reason")
         if rejection_reason is not None:
@@ -662,6 +690,124 @@ def _parse_verdicts_json(
 # ---------------------------------------------------------------------------
 
 
+async def _guarded_call(prompt: str, chunk_index: int, system_prompt: str) -> str:
+    """Issue one model call, bounded by the module semaphore."""
+    if _semaphore is None:          # direct call outside extract_commitments
+        return await _call_ollama(prompt, chunk_index, system_prompt)
+    async with _semaphore:
+        return await _call_ollama(prompt, chunk_index, system_prompt)
+
+
+async def _process_chunk(
+    chunk: TextChunk,
+    detect_prompt: str,
+    detect_id: str,
+    enrich_id: str,
+    model: str,
+    total_chunks: int,
+) -> list[ExtractedCommitment]:
+    """Run both stages for one chunk and return its records in sentence order.
+
+    Order is fixed by the sentence list, not by completion order, so a
+    concurrent run produces byte-identical output to a sequential one.
+    """
+    log = logger.bind(chunk_index=chunk.index, total_chunks=total_chunks)
+
+    sentences = _split_sentences(chunk.text)[:MAX_SENTENCES_PER_CALL]
+    if not sentences:
+        log.info("chunk_has_no_judgeable_sentences")
+        return []
+
+    # --- Stage 1: detection over numbered sentences -------------------------
+    detect_user = _DETECT_USER_TEMPLATE.format(numbered=_number_sentences(sentences))
+
+    try:
+        raw_response = await _guarded_call(detect_user, chunk.index, detect_prompt)
+    except (httpx.HTTPError, httpx.TimeoutException) as exc:
+        # str() on httpx timeout exceptions is often empty — use repr so the
+        # log says which failure it was instead of "error=".
+        log.error(
+            "ollama_call_failed_after_retries",
+            error=repr(exc),
+            error_type=type(exc).__name__,
+            timeout_seconds=settings.ollama_timeout_seconds,
+            chunk_skipped=True,
+        )
+        return []
+
+    verdicts = _parse_verdicts_json(raw_response, chunk, len(sentences))
+    missing = [i for i in range(1, len(sentences) + 1) if i not in verdicts]
+    if missing:
+        log.warning(
+            "detection_incomplete",
+            missing_ids=missing,
+            returned=len(verdicts),
+            expected=len(sentences),
+        )
+
+    # --- Assemble detections, in sentence order -----------------------------
+    detections: list[dict[str, Any]] = []
+    for idx, sentence in enumerate(sentences, start=1):
+        verdict = verdicts.get(idx)
+        if verdict is None:
+            # Model skipped this id. Record it as unsure rather than dropping
+            # it — a silently missing sentence is invisible in the results and
+            # would inflate apparent precision.
+            detection: dict[str, Any] = {
+                "text": sentence,
+                "is_commitment": "unsure",
+                "annotator_notes": "stage 1 returned no verdict for this sentence",
+            }
+        else:
+            detection = dict(verdict)
+            # Always use OUR sentence text, never the model's echo.
+            detection["text"] = sentence
+        detection.setdefault("context", chunk.text[:400])
+        detections.append(detection)
+
+    # --- Stage 2: enrichment, positives only, issued together ---------------
+    positive_positions = [
+        i for i, d in enumerate(detections)
+        if str(d.get("is_commitment", "")).lower().strip() == "yes"
+    ]
+
+    if positive_positions:
+        enriched = await asyncio.gather(
+            *(_enrich(detections[i], chunk) for i in positive_positions)
+        )
+        for i, merged in zip(positive_positions, enriched):
+            detections[i] = merged
+
+    for i, d in enumerate(detections):
+        is_positive = i in positive_positions
+        d["model"] = model
+        d["detect_prompt_id"] = detect_id
+        d["enrich_prompt_id"] = enrich_id if is_positive else None
+        if not is_positive:
+            detections[i] = _mark_fields_not_applicable(d)
+
+    records = [
+        rec for rec in (_dict_to_commitment(d, chunk) for d in detections)
+        if rec is not None
+    ]
+
+    log.info(
+        "chunk_processed",
+        sentences=len(sentences),
+        records_found=len(records),
+        positives=sum(1 for r in records if r.is_commitment is CommitmentDecision.YES),
+        rejections=sum(1 for r in records if r.is_commitment is CommitmentDecision.NO),
+        unsure=sum(1 for r in records if r.is_commitment is CommitmentDecision.UNSURE),
+        enrich_calls=len(positive_positions),
+    )
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
 async def extract_commitments(chunks: list[TextChunk]) -> list[ExtractedCommitment]:
     """Extract environmental commitments from document chunks, in two stages.
 
@@ -669,29 +815,33 @@ async def extract_commitments(chunks: list[TextChunk]) -> list[ExtractedCommitme
     verdict per id. Stage 2 sends each positive sentence back on its own and
     asks for its seven structural fields and verifiability level.
 
+    Chunks are processed concurrently and enrichment calls within a chunk are
+    issued together, bounded by :data:`CONCURRENCY`. Results are reassembled in
+    document order, so a concurrent run and a sequential run of the same input
+    produce identical output.
+
     Two properties follow from numbering the sentences ourselves:
 
     - **No silent omissions.** Any id the model fails to return is recorded as
-      ``unsure`` with a note, rather than vanishing. An earlier version let the
-      model choose which sentences to mention and it quietly dropped a
-      past-action sentence instead of rejecting it.
-    - **No transcription drift.** Record text is taken from the source
-      document by id, so a record can never contain a sentence the model
-      paraphrased or invented.
+      ``unsure`` with a note, rather than vanishing.
+    - **No transcription drift.** Record text is taken from the source document
+      by id, so a record can never contain a sentence the model paraphrased.
 
     Records judged NOT a commitment are retained — the benchmark needs
-    negatives to measure precision. They skip stage 2 and their structural
-    fields are marked ``not_applicable``.
+    negatives to measure precision. They skip stage 2, their structural fields
+    are marked ``not_applicable``, and their verifiability is None.
 
-    Every record carries the model tag and the identifiers of both prompts.
+    Every record carries the model tag and both prompt identifiers.
 
     Args:
         chunks: Ordered list of :class:`TextChunk` objects from
             :func:`backend.core.pipeline.chunker.chunk_text`.
 
     Returns:
-        Flat list of all :class:`ExtractedCommitment` objects across all chunks.
+        Flat list of all :class:`ExtractedCommitment` objects, in document order.
     """
+    global _semaphore
+
     if not chunks:
         logger.warning("extract_commitments called with empty chunk list")
         return []
@@ -706,106 +856,23 @@ async def extract_commitments(chunks: list[TextChunk]) -> list[ExtractedCommitme
         detect_prompt=detect_id,
         enrich_prompt=enrich_id,
         chunks=len(chunks),
+        concurrency=CONCURRENCY,
     )
 
-    all_records: list[ExtractedCommitment] = []
-
-    for chunk in chunks:
-        log = logger.bind(chunk_index=chunk.index, total_chunks=len(chunks))
-
-        sentences = _split_sentences(chunk.text)[:MAX_SENTENCES_PER_CALL]
-        if not sentences:
-            log.info("chunk_has_no_judgeable_sentences")
-            continue
-
-        # --- Stage 1: detection over numbered sentences ----------------------
-        detect_user = _DETECT_USER_TEMPLATE.format(
-            numbered=_number_sentences(sentences)
+    _semaphore = asyncio.Semaphore(CONCURRENCY)
+    try:
+        per_chunk = await asyncio.gather(
+            *(
+                _process_chunk(
+                    chunk, detect_prompt, detect_id, enrich_id, model, len(chunks)
+                )
+                for chunk in chunks
+            )
         )
+    finally:
+        _semaphore = None
 
-        try:
-            raw_response = await _call_ollama(
-                detect_user, chunk.index, detect_prompt
-            )
-        except (httpx.HTTPError, httpx.TimeoutException) as exc:
-            # str() on httpx timeout exceptions is often empty — use repr so the
-            # log says which failure it was instead of "error=".
-            log.error(
-                "ollama_call_failed_after_retries",
-                error=repr(exc),
-                error_type=type(exc).__name__,
-                timeout_seconds=settings.ollama_timeout_seconds,
-                chunk_skipped=True,
-            )
-            continue
-
-        verdicts = _parse_verdicts_json(raw_response, chunk, len(sentences))
-        missing = [i for i in range(1, len(sentences) + 1) if i not in verdicts]
-        if missing:
-            log.warning(
-                "detection_incomplete",
-                missing_ids=missing,
-                returned=len(verdicts),
-                expected=len(sentences),
-            )
-
-        # --- Stage 2: enrichment, positives only -----------------------------
-        chunk_records: list[ExtractedCommitment] = []
-        enriched_count = 0
-
-        for idx, sentence in enumerate(sentences, start=1):
-            verdict = verdicts.get(idx)
-
-            if verdict is None:
-                # Model skipped this id. Record it as unsure rather than
-                # dropping it — a silently missing sentence is invisible in
-                # the results and would inflate apparent precision.
-                detection: dict[str, Any] = {
-                    "text": sentence,
-                    "is_commitment": "unsure",
-                    "annotator_notes": "stage 1 returned no verdict for this sentence",
-                }
-            else:
-                detection = dict(verdict)
-                # Always use OUR sentence text, never the model's echo.
-                detection["text"] = sentence
-
-            detection.setdefault("context", chunk.text[:400])
-
-            decision = str(detection.get("is_commitment", "")).lower().strip()
-            if decision == "yes":
-                merged = await _enrich(detection, chunk)
-                enriched_count += 1
-            else:
-                merged = _mark_fields_not_applicable(detection)
-
-            merged["model"] = model
-            merged["detect_prompt_id"] = detect_id
-            merged["enrich_prompt_id"] = enrich_id if decision == "yes" else None
-
-            record = _dict_to_commitment(merged, chunk)
-            if record is not None:
-                chunk_records.append(record)
-
-        log.info(
-            "chunk_processed",
-            sentences=len(sentences),
-            records_found=len(chunk_records),
-            positives=sum(
-                1 for r in chunk_records
-                if r.is_commitment is CommitmentDecision.YES
-            ),
-            rejections=sum(
-                1 for r in chunk_records
-                if r.is_commitment is CommitmentDecision.NO
-            ),
-            unsure=sum(
-                1 for r in chunk_records
-                if r.is_commitment is CommitmentDecision.UNSURE
-            ),
-            enrich_calls=enriched_count,
-        )
-        all_records.extend(chunk_records)
+    all_records = [record for chunk_records in per_chunk for record in chunk_records]
 
     logger.info(
         "commitment_extraction_complete",

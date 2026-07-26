@@ -19,6 +19,7 @@ What these tests do prove:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, patch
 
@@ -672,6 +673,172 @@ class TestTwoStageFlow:
             records = await extract_commitments([make_chunk(index=7)])
 
         assert records[0].page_reference == "chunk_7"
+
+
+# ---------------------------------------------------------------------------
+# Verifiability is None for non-commitments
+#
+# A rejected sentence has nothing to verify. None ("does not arise") is a
+# different statement from UNSURE ("we looked and could not tell"). Warning on
+# every rejection buried real warnings under thousands of spurious ones.
+# ---------------------------------------------------------------------------
+
+
+class TestVerifiabilityOnNonCommitments:
+
+    @pytest.mark.asyncio
+    async def test_rejection_gets_none_not_unsure(self):
+        async def fake(prompt, chunk_index, system_prompt):
+            return verdicts_payload(
+                verdict(1, "no", rejection_reason="values_statement"),
+                verdict(2, "no", rejection_reason="past_action"),
+            )
+
+        with patch("backend.core.pipeline.commitment_extractor._call_ollama",
+                   new=AsyncMock(side_effect=fake)):
+            records = await extract_commitments([make_chunk()])
+
+        assert all(r.verifiability is None for r in records)
+
+    @pytest.mark.asyncio
+    async def test_rejection_logs_no_verifiability_warning(self, caplog):
+        async def fake(prompt, chunk_index, system_prompt):
+            return verdicts_payload(
+                verdict(1, "no", rejection_reason="values_statement"),
+                verdict(2, "no", rejection_reason="past_action"),
+            )
+
+        with patch("backend.core.pipeline.commitment_extractor._call_ollama",
+                   new=AsyncMock(side_effect=fake)):
+            with caplog.at_level("WARNING"):
+                await extract_commitments([make_chunk()])
+
+        assert "unknown_verifiability_level" not in caplog.text
+        assert "verifiability_missing_on_commitment" not in caplog.text
+
+    def test_positive_missing_verifiability_still_warns_and_is_unsure(self):
+        """Silence is expected for a rejection, not for a commitment."""
+        raw = base_record(is_commitment="yes")
+        raw.pop("verifiability")
+        record = _dict_to_commitment(raw, make_chunk())
+        assert record.verifiability is SubstantiationLevel.UNSURE
+
+    def test_invalid_level_still_degrades_to_unsure(self):
+        record = _dict_to_commitment(
+            base_record(is_commitment="yes", verifiability="highly verifiable"),
+            make_chunk(),
+        )
+        assert record.verifiability is SubstantiationLevel.UNSURE
+
+
+# ---------------------------------------------------------------------------
+# Concurrency
+#
+# Requests are issued in parallel, but output must not depend on completion
+# order — a benchmark whose record order shifts run to run is not reproducible.
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrency:
+
+    @staticmethod
+    def _chunks(n: int) -> list[TextChunk]:
+        return [make_chunk(index=i) for i in range(n)]
+
+    @staticmethod
+    def _responder(delay_by_chunk: dict[int, float] | None = None):
+        async def fake(prompt, chunk_index, system_prompt):
+            if delay_by_chunk:
+                await asyncio.sleep(delay_by_chunk.get(chunk_index, 0))
+            if system_prompt == detect_text():
+                return verdicts_payload(
+                    verdict(1, "yes"),
+                    verdict(2, "no", rejection_reason="past_action"),
+                )
+            return ENRICHMENT
+        return fake
+
+    @pytest.mark.asyncio
+    async def test_output_matches_sequential_run(self, monkeypatch):
+        """The equivalence check: concurrency must not change the answer."""
+        import backend.core.pipeline.commitment_extractor as ce
+
+        monkeypatch.setattr(ce, "CONCURRENCY", 1)
+        with patch.object(ce, "_call_ollama",
+                          new=AsyncMock(side_effect=self._responder())):
+            sequential = await extract_commitments(self._chunks(4))
+
+        monkeypatch.setattr(ce, "CONCURRENCY", 8)
+        with patch.object(ce, "_call_ollama",
+                          new=AsyncMock(side_effect=self._responder())):
+            parallel = await extract_commitments(self._chunks(4))
+
+        def comparable(records):
+            return [
+                (r.text, r.is_commitment, r.rejection_reason, r.page_reference,
+                 r.deadline.status, r.deadline.value, r.verifiability)
+                for r in records
+            ]
+
+        assert comparable(sequential) == comparable(parallel)
+
+    @pytest.mark.asyncio
+    async def test_document_order_survives_out_of_order_completion(self, monkeypatch):
+        """Chunk 0 is made slowest; it must still come first in the output."""
+        import backend.core.pipeline.commitment_extractor as ce
+
+        monkeypatch.setattr(ce, "CONCURRENCY", 8)
+        delays = {0: 0.05, 1: 0.03, 2: 0.01, 3: 0.0}
+        with patch.object(ce, "_call_ollama",
+                          new=AsyncMock(side_effect=self._responder(delays))):
+            records = await extract_commitments(self._chunks(4))
+
+        pages = [r.page_reference for r in records]
+        assert pages == sorted(pages, key=lambda p: int(p.split("_")[1]))
+
+    @pytest.mark.asyncio
+    async def test_semaphore_bounds_requests_in_flight(self, monkeypatch):
+        import backend.core.pipeline.commitment_extractor as ce
+
+        monkeypatch.setattr(ce, "CONCURRENCY", 3)
+        in_flight = 0
+        peak = 0
+
+        async def fake(prompt, chunk_index, system_prompt):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+            if system_prompt == detect_text():
+                return verdicts_payload(verdict(1, "no", rejection_reason="past_action"),
+                                        verdict(2, "no", rejection_reason="past_action"))
+            return ENRICHMENT
+
+        with patch.object(ce, "_call_ollama", new=AsyncMock(side_effect=fake)):
+            await extract_commitments(self._chunks(10))
+
+        assert peak <= 3, f"peak in-flight was {peak}, limit was 3"
+
+    @pytest.mark.asyncio
+    async def test_one_failing_chunk_does_not_sink_the_others(self, monkeypatch):
+        import backend.core.pipeline.commitment_extractor as ce
+
+        monkeypatch.setattr(ce, "CONCURRENCY", 4)
+
+        async def fake(prompt, chunk_index, system_prompt):
+            if chunk_index == 1:
+                raise httpx.TimeoutException("chunk 1 is unlucky")
+            if system_prompt == detect_text():
+                return verdicts_payload(verdict(1, "no", rejection_reason="past_action"),
+                                        verdict(2, "no", rejection_reason="past_action"))
+            return ENRICHMENT
+
+        with patch.object(ce, "_call_ollama", new=AsyncMock(side_effect=fake)):
+            records = await extract_commitments(self._chunks(3))
+
+        pages = {r.page_reference for r in records}
+        assert pages == {"chunk_0", "chunk_2"}
 
 
 # ---------------------------------------------------------------------------

@@ -79,6 +79,15 @@ def parse_args() -> argparse.Namespace:
         "--dump-raw", default=None, metavar="DIR",
         help="Write every raw model response to DIR/chunk_<n>.txt before parsing",
     )
+    parser.add_argument(
+        "--concurrency", type=int, default=None,
+        help=(
+            "Requests in flight at once (default from config, 4). Ollama "
+            "serialises per model unless OLLAMA_NUM_PARALLEL is also raised, "
+            "so set both. Each parallel slot needs its own KV cache at "
+            "num_ctx, so watch VRAM."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -101,12 +110,15 @@ async def main() -> int:
         commitment_extractor.NUM_CTX = args.num_ctx
     if args.dump_raw:
         commitment_extractor.RAW_DUMP_DIR = args.dump_raw
+    if args.concurrency is not None:
+        commitment_extractor.CONCURRENCY = args.concurrency
 
     print(f"Model:   {settings.ollama_model}")
     print(f"Ollama:  {settings.ollama_base_url}")
     print(f"Timeout: {settings.ollama_timeout_seconds}s per request")
     print(f"Context: num_ctx={commitment_extractor.NUM_CTX}, "
           f"num_predict={commitment_extractor.NUM_PREDICT}")
+    print(f"Parallel:{commitment_extractor.CONCURRENCY} requests in flight")
     print(f"PDF:     {pdf_path.name}")
 
     # --- 1. PDF -> text ----------------------------------------------------
