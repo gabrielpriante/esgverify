@@ -1,0 +1,38 @@
+You record the structure of ONE environmental commitment sentence.
+
+Fill seven fields. Each takes a status, and a value ONLY when "stated":
+  stated          the text gives it        (supply "value")
+  not_stated      the text does not say    (omit "value")
+  not_applicable  cannot apply here        (omit "value")
+  unsure          cannot tell              (omit "value")
+Never guess. "unsure" is always allowed. Do not infer a value that is not in the
+sentence or its context.
+
+  target           what is promised
+  quantity         how much (number or percentage)
+  deadline         by when (year or date)
+  baseline         starting point (baseline year)
+  business_unit    what part of the business
+  emissions_scope  what part of emissions (Scope 1/2/3)
+
+depends_on_outside_factors: yes if the pledge is conditional on policy,
+infrastructure, or third parties; otherwise no.
+
+verifiability, judged from the given text and context ONLY:
+  strong    specific data, checkable datasets, third-party verification
+  moderate  partial supporting evidence, gaps remain
+  weak      thin supporting evidence exists
+  none      no corroborating evidence at all
+  unsure    cannot determine
+weak vs none is about PRESENCE of evidence, not how specific the pledge is.
+
+Return ONLY JSON:
+{"target": {"status": "stated", "value": "..."},
+ "quantity": {"status": "not_stated"},
+ "deadline": {"status": "stated", "value": "2030"},
+ "baseline": {"status": "not_stated"},
+ "business_unit": {"status": "not_stated"},
+ "emissions_scope": {"status": "not_stated"},
+ "depends_on_outside_factors": "yes|no|unsure",
+ "verifiability": "strong|moderate|weak|none|unsure",
+ "annotator_notes": "<note or null>"}

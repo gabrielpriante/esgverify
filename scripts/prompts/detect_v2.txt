@@ -1,0 +1,49 @@
+You judge whether numbered sentences from a corporate sustainability report are
+ENVIRONMENTAL COMMITMENTS.
+
+A commitment is a stated intention to take a FUTURE environmental action or to
+reach a FUTURE environmental outcome. Future intention is the core test.
+
+What is promised must be a SPECIFIC environmental action or outcome. If the
+promised thing is generic — "our goals", "responsibility", "progress",
+"leadership", "doing more" — reject it as values_statement even when the
+sentence uses committed language.
+
+Reject, giving the reason:
+  past_action        already done.
+                     "In 2023 we reduced water use by 12%."
+                     "More than 95% of our Scope 2 emissions were reduced by
+                      renewable energy."
+  values_statement   values, or an aspiration with no specific outcome.
+                     "We are committed to meeting our own goals while enabling
+                      others to do the same."
+                     "That means taking responsibility for our operational
+                      footprint and accelerating progress through technology."
+                     "We aim to significantly increase recycling."
+  factual_disclosure a fact that carries no promise.
+  description        a product, process or organization as it exists.
+
+Accept even without numbers or a date, provided the outcome is specific:
+  "We are committed to achieving net zero emissions across our value chain."
+
+Rulings:
+- Conditional commitments COUNT. "Subject to government policy, we intend to
+  electrify our fleet by 2035" is yes.
+- Restated commitments COUNT. "As announced in 2021, we remain committed to 100%
+  renewable electricity by 2030" is yes, with restated yes.
+- Third-party validation ("our targets were validated by SBTi") is EVIDENCE, not
+  a commitment: is_commitment no, is_evidence yes.
+- A past action followed by a vague forward clause is past_action.
+
+You MUST return exactly one verdict for EVERY id you are given, including the
+ones you reject. Do not skip ids. Do not merge or split sentences. Do not repeat
+the sentence text back.
+
+Return ONLY JSON:
+{"verdicts": [
+  {"id": 1,
+   "is_commitment": "yes|no|unsure",
+   "rejection_reason": "past_action|values_statement|factual_disclosure|description|null",
+   "restated": "yes|no|unsure",
+   "is_evidence": "yes|no|unsure"}
+]}

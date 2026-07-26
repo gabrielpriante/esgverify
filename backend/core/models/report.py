@@ -325,3 +325,18 @@ class ExtractedCommitment(BaseModel):
         None,
         description="Free-text ambiguity notes; never affects the level assigned",
     )
+
+    # --- Provenance ---------------------------------------------------------
+    # Recorded per record, not per run: a single output file may mix results
+    # from a resumed or re-prompted run, and the paper has to be able to say
+    # exactly which model and which prompt wording produced each row.
+    model: Optional[str] = Field(
+        None, description="Ollama model tag that produced this record"
+    )
+    detect_prompt_id: Optional[str] = Field(
+        None, description="Stage 1 prompt identifier, '<file>@<sha256[:12]>'"
+    )
+    enrich_prompt_id: Optional[str] = Field(
+        None,
+        description="Stage 2 prompt identifier; None if enrichment did not run",
+    )

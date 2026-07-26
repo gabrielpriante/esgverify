@@ -6,14 +6,15 @@ Microsoft development PDF, run separately.
 
 What these tests do prove:
 - The five rulings locked in notes/decisions.md (07/25/2026) survive the round
-  trip from LLM JSON to ExtractedCommitment, using worked examples 6-10 from
+  trip from model JSON to ExtractedCommitment, using worked examples 6-10 from
   paper/task_definition.md as fixtures.
 - "not stated", "not applicable" and "unsure" stay distinct rather than
   collapsing into each other or into null.
 - Malformed model output degrades to "unsure", never to a confident value.
-- The five-level verifiability scale (including UNSURE) round-trips.
-- The two-stage flow: negatives skip enrichment, positives trigger it, and a
-  failed enrichment degrades to 'unsure' rather than inventing values.
+- RECALL: every sentence gets a record. A sentence the model omits becomes
+  "unsure", not a silent disappearance.
+- Record text always comes from the source document, never the model's echo.
+- Every record carries the model tag and both prompt identifiers.
 """
 
 from __future__ import annotations
@@ -35,19 +36,28 @@ from backend.core.models.report import (
 )
 from backend.core.pipeline.chunker import TextChunk
 from backend.core.pipeline.commitment_extractor import (
+    DETECT_PROMPT_FILE,
+    ENRICH_PROMPT_FILE,
     _coerce_field,
     _coerce_flag,
     _dict_to_commitment,
-    _parse_commitments_json,
+    _parse_verdicts_json,
+    _split_sentences,
     extract_commitments,
 )
+from backend.core.pipeline.prompts import PROMPT_TOKEN_BUDGET, load_prompt
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+TWO_SENTENCE_CHUNK = (
+    "We are driving robust programs in efforts to be carbon negative by 2030. "
+    "More than 95% of our Scope 2 emissions were reduced by renewable energy."
+)
 
-def make_chunk(text: str = "irrelevant", index: int = 0) -> TextChunk:
+
+def make_chunk(text: str = TWO_SENTENCE_CHUNK, index: int = 0) -> TextChunk:
     return TextChunk(index=index, text=text, char_start=0, char_end=len(text))
 
 
@@ -59,7 +69,7 @@ def field(status: str, value: str | None = None) -> dict:
 
 
 def base_record(**overrides) -> dict:
-    """A minimally valid raw record; override per fixture."""
+    """A minimally valid merged record, as _dict_to_commitment receives it."""
     record = {
         "text": "placeholder",
         "context": "placeholder context",
@@ -79,6 +89,33 @@ def base_record(**overrides) -> dict:
     }
     record.update(overrides)
     return record
+
+
+def verdicts_payload(*verdicts) -> str:
+    return json.dumps({"verdicts": list(verdicts)})
+
+
+def verdict(vid: int, decision: str, **extra) -> dict:
+    v = {"id": vid, "is_commitment": decision, "restated": "no", "is_evidence": "no"}
+    v.update(extra)
+    return v
+
+
+ENRICHMENT = json.dumps({
+    "target": {"status": "stated", "value": "become carbon negative"},
+    "quantity": {"status": "not_stated"},
+    "deadline": {"status": "stated", "value": "2030"},
+    "baseline": {"status": "not_stated"},
+    "business_unit": {"status": "not_stated"},
+    "emissions_scope": {"status": "not_stated"},
+    "depends_on_outside_factors": "no",
+    "verifiability": "weak",
+    "annotator_notes": None,
+})
+
+
+def detect_text() -> str:
+    return load_prompt(DETECT_PROMPT_FILE)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +138,6 @@ class TestLockedRulings:
             target=field("stated", "transition fleet to electric vehicles"),
             deadline=field("stated", "2035"),
             business_unit=field("stated", "vehicle fleet"),
-            emissions_scope=field("not_stated"),
             depends_on_outside_factors="yes",
             verifiability="weak",
         )
@@ -109,7 +145,6 @@ class TestLockedRulings:
         record = _dict_to_commitment(raw, make_chunk())
 
         assert record is not None
-        # The ruling: it counts.
         assert record.is_commitment is CommitmentDecision.YES
         # The caveat is captured as data, not used to reject.
         assert record.depends_on_outside_factors is FlagValue.YES
@@ -159,12 +194,7 @@ class TestLockedRulings:
         assert record.quantity.value == "100%"
 
     def test_ruling_annotation_unit_is_sentence_level(self):
-        """Example 9: a mixed past/future sentence is judged whole, and rejected.
-
-        Sentence-level annotation means the vague forward clause does not rescue
-        the sentence. Under span-level annotation this case could split — that is
-        recorded as future work, not v1 behaviour.
-        """
+        """Example 9: a mixed past/future sentence is judged whole, and rejected."""
         raw = base_record(
             text=(
                 "We have installed solar capacity at twelve facilities and will "
@@ -180,7 +210,6 @@ class TestLockedRulings:
         assert record is not None
         assert record.is_commitment is CommitmentDecision.NO
         assert record.rejection_reason == "past_action"
-        # Judged as one unit: the whole sentence is retained verbatim.
         assert record.text.startswith("We have installed")
         assert record.text.endswith("continue this program.")
 
@@ -203,7 +232,6 @@ class TestLockedRulings:
         assert record is not None
         assert record.is_commitment is CommitmentDecision.NO
         assert record.is_evidence is FlagValue.YES
-        # Evidence must be linkable back to the commitment it supports.
         assert "supports_commitment_id" in ExtractedCommitment.model_fields
 
 
@@ -246,8 +274,7 @@ class TestFieldStatusDistinctness:
         assert result.status is FieldStatus.UNSURE
 
     def test_stated_with_blank_value_degrades_to_unsure(self):
-        result = _coerce_field(field("stated", "   "), "deadline", 0)
-        assert result.status is FieldStatus.UNSURE
+        assert _coerce_field(field("stated", "   "), "deadline", 0).status is FieldStatus.UNSURE
 
     def test_model_rejects_stated_without_value(self):
         with pytest.raises(ValidationError):
@@ -305,9 +332,7 @@ class TestMalformedInputDegradesToUnsure:
 
 class TestVerifiabilityScale:
 
-    @pytest.mark.parametrize(
-        "level", ["strong", "moderate", "weak", "none", "unsure"]
-    )
+    @pytest.mark.parametrize("level", ["strong", "moderate", "weak", "none", "unsure"])
     def test_all_five_levels_round_trip(self, level):
         record = _dict_to_commitment(base_record(verifiability=level), make_chunk())
         assert record is not None
@@ -322,273 +347,207 @@ class TestVerifiabilityScale:
 
 
 # ---------------------------------------------------------------------------
-# JSON parsing
+# Sentence splitting
 # ---------------------------------------------------------------------------
 
 
-class TestParseCommitmentsJson:
+class TestSplitSentences:
+
+    def test_splits_on_sentence_boundaries(self):
+        assert len(_split_sentences(TWO_SENTENCE_CHUNK)) == 2
+
+    def test_collapses_pdf_hard_line_breaks(self):
+        """PDF extraction breaks lines mid-sentence; that must not create
+        spurious sentence boundaries."""
+        pdf_style = "We will be carbon\nnegative by 2030. We also plan much more."
+        out = _split_sentences(pdf_style)
+        assert out[0] == "We will be carbon negative by 2030."
+
+    def test_numeric_continuation_does_not_behead_a_sentence(self):
+        """Real chunk 39 layout: 'our Scope' ends a line and '2 emissions...'
+        begins the next. Treating the numeric line as a new unit produced the
+        fragment '2 emissions were reduced by renewable energy' — losing the
+        subject of the exact past-action sentence we need to reject."""
+        pdf_style = "More than 95% of our Scope\n2 emissions were reduced by renewable energy."
+        out = _split_sentences(pdf_style)
+        assert len(out) == 1
+        assert out[0].startswith("More than 95%")
+
+    def test_drops_navigation_furniture(self):
+        """'Overview', 'Earn trust', 'Learn more' are layout, not claims."""
+        assert _split_sentences("Overview\nEarn trust\nLearn more") == []
+
+    def test_preserves_document_order(self):
+        out = _split_sentences(TWO_SENTENCE_CHUNK)
+        assert out[0].startswith("We are driving")
+        assert out[1].startswith("More than 95%")
+
+
+# ---------------------------------------------------------------------------
+# Id-keyed verdict parsing
+# ---------------------------------------------------------------------------
+
+
+class TestParseVerdictsJson:
 
     def test_parses_well_formed_payload(self):
-        payload = json.dumps({"commitments": [base_record()]})
-        assert len(_parse_commitments_json(payload, make_chunk())) == 1
+        raw = verdicts_payload(verdict(1, "yes"), verdict(2, "no"))
+        assert set(_parse_verdicts_json(raw, make_chunk(), 2)) == {1, 2}
 
     def test_strips_markdown_fences(self):
-        payload = "```json\n" + json.dumps({"commitments": []}) + "\n```"
-        assert _parse_commitments_json(payload, make_chunk()) == []
+        raw = "```json\n" + verdicts_payload(verdict(1, "yes")) + "\n```"
+        assert set(_parse_verdicts_json(raw, make_chunk(), 1)) == {1}
 
-    @pytest.mark.parametrize(
-        "payload",
-        [
-            "not json at all",
-            "{",
-            json.dumps({"claims": []}),          # wrong key — old claim schema
-            json.dumps({"commitments": "nope"}),  # wrong type
-            json.dumps([1, 2, 3]),                # not an object
-        ],
-    )
+    def test_discards_out_of_range_ids(self):
+        """An invented id means the model lost track of the list; mapping it
+        onto a real sentence would attach a verdict to text it never saw."""
+        raw = verdicts_payload(verdict(1, "yes"), verdict(99, "yes"))
+        assert set(_parse_verdicts_json(raw, make_chunk(), 2)) == {1}
+
+    def test_discards_verdicts_without_id(self):
+        raw = json.dumps({"verdicts": [{"is_commitment": "yes"}]})
+        assert _parse_verdicts_json(raw, make_chunk(), 2) == {}
+
+    @pytest.mark.parametrize("payload", [
+        "not json at all",
+        "{",
+        json.dumps({"commitments": []}),      # the old stage-1 shape
+        json.dumps({"verdicts": "nope"}),
+        json.dumps([1, 2, 3]),
+    ])
     def test_malformed_payloads_return_empty_without_raising(self, payload):
-        assert _parse_commitments_json(payload, make_chunk()) == []
+        assert _parse_verdicts_json(payload, make_chunk(), 2) == {}
 
 
 # ---------------------------------------------------------------------------
-# extract_commitments orchestration (Ollama fully mocked)
-# ---------------------------------------------------------------------------
-
-
-class TestExtractCommitments:
-
-    @pytest.mark.asyncio
-    async def test_empty_chunk_list_returns_empty(self):
-        assert await extract_commitments([]) == []
-
-    @pytest.mark.asyncio
-    async def test_negatives_are_retained(self):
-        """The benchmark needs negatives; precision cannot be measured without them."""
-        payload = json.dumps({
-            "commitments": [
-                base_record(text="We will cut emissions 50% by 2030.", is_commitment="yes"),
-                base_record(text="Sustainability is at our heart.",
-                            is_commitment="no", rejection_reason="values_statement"),
-            ]
-        })
-        with patch(
-            "backend.core.pipeline.commitment_extractor._call_ollama",
-            new=AsyncMock(return_value=payload),
-        ):
-            records = await extract_commitments([make_chunk()])
-
-        assert len(records) == 2
-        assert sum(1 for r in records if r.is_commitment is CommitmentDecision.YES) == 1
-        assert sum(1 for r in records if r.is_commitment is CommitmentDecision.NO) == 1
-
-    @pytest.mark.asyncio
-    async def test_failed_chunk_is_skipped_not_fatal(self):
-        payload = json.dumps({"commitments": [base_record()]})
-        responses = [httpx.TimeoutException("boom"), payload]
-
-        async def side_effect(prompt, chunk_index, system_prompt):
-            result = responses[chunk_index]
-            if isinstance(result, Exception):
-                raise result
-            return result
-
-        with patch(
-            "backend.core.pipeline.commitment_extractor._call_ollama",
-            new=AsyncMock(side_effect=side_effect),
-        ):
-            records = await extract_commitments([make_chunk(index=0), make_chunk(index=1)])
-
-        assert len(records) == 1
-
-    @pytest.mark.asyncio
-    async def test_page_reference_falls_back_to_chunk_index(self):
-        payload = json.dumps({"commitments": [base_record()]})
-        with patch(
-            "backend.core.pipeline.commitment_extractor._call_ollama",
-            new=AsyncMock(return_value=payload),
-        ):
-            records = await extract_commitments([make_chunk(index=7)])
-
-        assert records[0].page_reference == "chunk_7"
-
-    @pytest.mark.asyncio
-    async def test_commitment_ids_are_unique(self):
-        payload = json.dumps({"commitments": [base_record(), base_record()]})
-        with patch(
-            "backend.core.pipeline.commitment_extractor._call_ollama",
-            new=AsyncMock(return_value=payload),
-        ):
-            records = await extract_commitments([make_chunk()])
-
-        assert len({r.commitment_id for r in records}) == 2
-
-
-# ---------------------------------------------------------------------------
-# Prompt content guards
+# Recall — the failure this design exists to prevent
 #
-# The prompt is the experimental instrument. These assertions fail loudly if a
-# future edit reintroduces the claim-extraction framing.
+# An earlier version asked the model to find and quote commitment sentences
+# itself. On chunk 39 of the Microsoft Impact Summary it returned four
+# positives, zero rejections, and silently omitted a Scope 2 past-action
+# sentence rather than rejecting it. Invisible in the output, and it would have
+# inflated apparent precision.
 # ---------------------------------------------------------------------------
 
 
-class TestPromptsEncodeTheDefinition:
-    """The prompts are the experimental instrument.
-
-    These assertions fail loudly if a future edit reintroduces the claim
-    framing, drops a ruling, or lets a prompt grow past the size that made the
-    model degenerate on real hardware.
-    """
-
-    def _detect(self) -> str:
-        from backend.core.pipeline.commitment_extractor import _DETECT_SYSTEM_PROMPT
-        return _DETECT_SYSTEM_PROMPT
-
-    def _enrich(self) -> str:
-        from backend.core.pipeline.commitment_extractor import _ENRICH_SYSTEM_PROMPT
-        return _ENRICH_SYSTEM_PROMPT
-
-    # --- size guard -------------------------------------------------------
-
-    def test_both_prompts_stay_within_token_budget(self):
-        """A combined ~1,190-token prompt plus a ~400-token chunk produced
-        word-salad from llama3.1:8b on a mid-range GPU. Two-stage exists to
-        keep each call well under that ceiling; this test keeps it that way."""
-        from backend.core.pipeline.commitment_extractor import PROMPT_TOKEN_BUDGET
-        for name, prompt in (("detect", self._detect()), ("enrich", self._enrich())):
-            approx_tokens = len(prompt) // 4
-            assert approx_tokens < PROMPT_TOKEN_BUDGET, (
-                f"{name} prompt is ~{approx_tokens} tokens, "
-                f"budget is {PROMPT_TOKEN_BUDGET}"
-            )
-
-    # --- detection prompt -------------------------------------------------
-
-    def test_past_action_example_is_not_present_as_positive(self):
-        """The old claim prompt used 'reduced Scope 1 emissions by 30%' as a
-        positive example. The guideline excludes past actions outright."""
-        assert "reduced Scope 1 emissions by 30%" not in self._detect()
-
-    def test_future_intention_is_the_core_criterion(self):
-        prompt = self._detect().lower()
-        assert "future" in prompt
-        assert "future intention is the core test" in prompt
-
-    def test_all_four_rejection_categories_present(self):
-        prompt = self._detect()
-        for category in (
-            "past_action",
-            "values_statement",
-            "factual_disclosure",
-            "description",
-        ):
-            assert category in prompt
-
-    def test_three_locked_rulings_present(self):
-        prompt = self._detect().lower()
-        assert "conditional commitments count" in prompt
-        assert "restated commitments count" in prompt
-        assert "evidence, not a commitment" in prompt
-
-    def test_sentence_level_unit_declared(self):
-        assert "ONE SENTENCE AT A TIME" in self._detect()
-
-    def test_negatives_are_requested(self):
-        assert "including the ones you reject" in self._detect()
-
-    # --- enrichment prompt ------------------------------------------------
-
-    def test_all_seven_structural_fields_present(self):
-        prompt = self._enrich()
-        for field_name in (
-            "target", "quantity", "deadline", "baseline",
-            "business_unit", "emissions_scope", "depends_on_outside_factors",
-        ):
-            assert field_name in prompt
-
-    def test_all_four_field_statuses_present(self):
-        prompt = self._enrich()
-        for status in ("stated", "not_stated", "not_applicable", "unsure"):
-            assert status in prompt
-
-    def test_all_five_verifiability_levels_present(self):
-        prompt = self._enrich()
-        for level in ("strong", "moderate", "weak", "none", "unsure"):
-            assert level in prompt
-
-    def test_weak_none_boundary_rule_present(self):
-        assert "PRESENCE of evidence" in self._enrich()
-
-    # --- both -------------------------------------------------------------
-
-    def test_neither_prompt_solicits_governance_claims(self):
-        """These extractors are environmental-commitment only."""
-        assert "governance" not in self._detect().lower()
-        assert "governance" not in self._enrich().lower()
-
-
-# ---------------------------------------------------------------------------
-# Two-stage flow
-#
-# Stage 1 (detect) judges a whole chunk. Stage 2 (enrich) runs per positive
-# sentence. The split exists because one combined prompt exceeded the effective
-# context window on real hardware and produced word-salad.
-# ---------------------------------------------------------------------------
-
-
-def detect_payload(*records) -> str:
-    return json.dumps({"commitments": list(records)})
-
-
-def detection(text: str, decision: str, **extra) -> dict:
-    d = {"text": text, "context": f"context for {text}",
-         "is_commitment": decision, "restated": "no", "is_evidence": "no"}
-    d.update(extra)
-    return d
-
-
-ENRICHMENT = json.dumps({
-    "target": {"status": "stated", "value": "become carbon negative"},
-    "quantity": {"status": "not_stated"},
-    "deadline": {"status": "stated", "value": "2030"},
-    "baseline": {"status": "not_stated"},
-    "business_unit": {"status": "not_stated"},
-    "emissions_scope": {"status": "not_stated"},
-    "depends_on_outside_factors": "no",
-    "verifiability": "weak",
-    "annotator_notes": None,
-})
-
-
-class TestTwoStageFlow:
+class TestRecall:
 
     @pytest.mark.asyncio
-    async def test_negative_skips_enrichment(self):
-        """A rejected sentence must not cost a second model call."""
-        calls = []
-
+    async def test_skipped_sentence_becomes_unsure_not_dropped(self):
         async def fake(prompt, chunk_index, system_prompt):
-            calls.append(system_prompt)
-            return detect_payload(
-                detection("In 2023 we reduced water use by 12%.", "no",
-                          rejection_reason="past_action")
+            # verdict for sentence 1 only; sentence 2 omitted entirely
+            return verdicts_payload(
+                verdict(1, "no", rejection_reason="values_statement")
             )
 
         with patch("backend.core.pipeline.commitment_extractor._call_ollama",
                    new=AsyncMock(side_effect=fake)):
             records = await extract_commitments([make_chunk()])
 
-        assert len(calls) == 1          # detection only
-        assert len(records) == 1
-        assert records[0].is_commitment is CommitmentDecision.NO
+        assert len(records) == 2, "an omitted sentence must still produce a record"
+        skipped = records[1]
+        assert skipped.is_commitment is CommitmentDecision.UNSURE
+        assert "no verdict" in (skipped.annotator_notes or "")
 
     @pytest.mark.asyncio
-    async def test_negative_fields_are_not_applicable_not_not_stated(self):
-        """A non-commitment has no deadline — that is not_applicable, which is
-        a different claim from 'the document did not say'."""
+    async def test_past_action_returns_as_explicit_rejection(self):
         async def fake(prompt, chunk_index, system_prompt):
-            return detect_payload(
-                detection("Sustainability is at our heart.", "no",
-                          rejection_reason="values_statement")
+            if system_prompt == detect_text():
+                return verdicts_payload(
+                    verdict(1, "yes"),
+                    verdict(2, "no", rejection_reason="past_action"),
+                )
+            return ENRICHMENT
+
+        with patch("backend.core.pipeline.commitment_extractor._call_ollama",
+                   new=AsyncMock(side_effect=fake)):
+            records = await extract_commitments([make_chunk()])
+
+        rejected = [r for r in records if r.is_commitment is CommitmentDecision.NO]
+        assert len(rejected) == 1
+        assert rejected[0].rejection_reason == "past_action"
+        assert "Scope 2 emissions were reduced" in rejected[0].text
+
+    @pytest.mark.asyncio
+    async def test_record_text_comes_from_source_not_model_echo(self):
+        """Guards against transcription drift and invented quotes."""
+        async def fake(prompt, chunk_index, system_prompt):
+            return verdicts_payload(
+                verdict(1, "no", rejection_reason="values_statement",
+                        text="A SENTENCE THE MODEL MADE UP"),
+                verdict(2, "no", rejection_reason="past_action"),
+            )
+
+        with patch("backend.core.pipeline.commitment_extractor._call_ollama",
+                   new=AsyncMock(side_effect=fake)):
+            records = await extract_commitments([make_chunk()])
+
+        assert all("MADE UP" not in r.text for r in records)
+        assert records[0].text.startswith("We are driving")
+
+    @pytest.mark.asyncio
+    async def test_every_sentence_gets_a_record_even_when_model_returns_nothing(self):
+        async def fake(prompt, chunk_index, system_prompt):
+            return verdicts_payload()
+
+        with patch("backend.core.pipeline.commitment_extractor._call_ollama",
+                   new=AsyncMock(side_effect=fake)):
+            records = await extract_commitments([make_chunk()])
+
+        assert len(records) == len(_split_sentences(TWO_SENTENCE_CHUNK))
+        assert all(r.is_commitment is CommitmentDecision.UNSURE for r in records)
+
+
+# ---------------------------------------------------------------------------
+# Two-stage flow
+# ---------------------------------------------------------------------------
+
+
+class TestTwoStageFlow:
+
+    @pytest.mark.asyncio
+    async def test_empty_chunk_list_returns_empty(self):
+        assert await extract_commitments([]) == []
+
+    @pytest.mark.asyncio
+    async def test_chunk_with_no_judgeable_sentences_is_skipped(self):
+        called = []
+
+        async def fake(prompt, chunk_index, system_prompt):
+            called.append(1)
+            return verdicts_payload()
+
+        with patch("backend.core.pipeline.commitment_extractor._call_ollama",
+                   new=AsyncMock(side_effect=fake)):
+            records = await extract_commitments([make_chunk("Overview\nLearn more")])
+
+        assert records == []
+        assert called == [], "must not spend a model call on layout furniture"
+
+    @pytest.mark.asyncio
+    async def test_negatives_skip_enrichment(self):
+        systems = []
+
+        async def fake(prompt, chunk_index, system_prompt):
+            systems.append(system_prompt)
+            return verdicts_payload(
+                verdict(1, "no", rejection_reason="values_statement"),
+                verdict(2, "no", rejection_reason="past_action"),
+            )
+
+        with patch("backend.core.pipeline.commitment_extractor._call_ollama",
+                   new=AsyncMock(side_effect=fake)):
+            records = await extract_commitments([make_chunk()])
+
+        assert len(systems) == 1, "detection only; negatives cost no second call"
+        assert len(records) == 2
+
+    @pytest.mark.asyncio
+    async def test_negative_fields_are_not_applicable(self):
+        async def fake(prompt, chunk_index, system_prompt):
+            return verdicts_payload(
+                verdict(1, "no", rejection_reason="values_statement"),
+                verdict(2, "no", rejection_reason="past_action"),
             )
 
         with patch("backend.core.pipeline.commitment_extractor._call_ollama",
@@ -603,12 +562,10 @@ class TestTwoStageFlow:
     @pytest.mark.asyncio
     async def test_positive_triggers_enrichment_and_merges_fields(self):
         async def fake(prompt, chunk_index, system_prompt):
-            from backend.core.pipeline.commitment_extractor import (
-                _DETECT_SYSTEM_PROMPT,
-            )
-            if system_prompt is _DETECT_SYSTEM_PROMPT:
-                return detect_payload(
-                    detection("We will be carbon negative by 2030.", "yes")
+            if system_prompt == detect_text():
+                return verdicts_payload(
+                    verdict(1, "yes"),
+                    verdict(2, "no", rejection_reason="past_action"),
                 )
             return ENRICHMENT
 
@@ -619,20 +576,16 @@ class TestTwoStageFlow:
         r = records[0]
         assert r.is_commitment is CommitmentDecision.YES
         assert r.deadline.value == "2030"
-        assert r.target.value == "become carbon negative"
         assert r.verifiability is SubstantiationLevel.WEAK
 
     @pytest.mark.asyncio
     async def test_enrichment_failure_degrades_to_unsure(self):
-        """If stage 2 fails, the record survives with unsure fields rather than
-        being dropped or filled with invented values."""
+        """Keep the judgement we earned; don't invent the rest."""
         async def fake(prompt, chunk_index, system_prompt):
-            from backend.core.pipeline.commitment_extractor import (
-                _DETECT_SYSTEM_PROMPT,
-            )
-            if system_prompt is _DETECT_SYSTEM_PROMPT:
-                return detect_payload(
-                    detection("We will be carbon negative by 2030.", "yes")
+            if system_prompt == detect_text():
+                return verdicts_payload(
+                    verdict(1, "yes"),
+                    verdict(2, "no", rejection_reason="past_action"),
                 )
             raise httpx.TimeoutException("enrich timed out")
 
@@ -641,21 +594,19 @@ class TestTwoStageFlow:
             records = await extract_commitments([make_chunk()])
 
         r = records[0]
-        assert r.is_commitment is CommitmentDecision.YES   # detection survives
+        assert r.is_commitment is CommitmentDecision.YES
         assert r.deadline.status is FieldStatus.UNSURE
         assert r.verifiability is SubstantiationLevel.UNSURE
 
     @pytest.mark.asyncio
-    async def test_enrichment_garbage_json_degrades_to_unsure(self):
+    async def test_enrichment_garbage_degrades_to_unsure(self):
         async def fake(prompt, chunk_index, system_prompt):
-            from backend.core.pipeline.commitment_extractor import (
-                _DETECT_SYSTEM_PROMPT,
-            )
-            if system_prompt is _DETECT_SYSTEM_PROMPT:
-                return detect_payload(
-                    detection("We will be carbon negative by 2030.", "yes")
+            if system_prompt == detect_text():
+                return verdicts_payload(
+                    verdict(1, "yes"),
+                    verdict(2, "no", rejection_reason="past_action"),
                 )
-            return '{ "I\'m the ": "word salad'
+            return '{ "word": "salad'
 
         with patch("backend.core.pipeline.commitment_extractor._call_ollama",
                    new=AsyncMock(side_effect=fake)):
@@ -664,19 +615,25 @@ class TestTwoStageFlow:
         assert records[0].target.status is FieldStatus.UNSURE
 
     @pytest.mark.asyncio
-    async def test_enrich_call_count_scales_with_positives(self):
+    async def test_failed_detection_skips_chunk_without_crashing(self):
+        async def fake(prompt, chunk_index, system_prompt):
+            raise httpx.TimeoutException("detect timed out")
+
+        with patch("backend.core.pipeline.commitment_extractor._call_ollama",
+                   new=AsyncMock(side_effect=fake)):
+            records = await extract_commitments([make_chunk()])
+
+        assert records == []
+
+    @pytest.mark.asyncio
+    async def test_enrich_calls_scale_with_positives_only(self):
         enrich_calls = []
 
         async def fake(prompt, chunk_index, system_prompt):
-            from backend.core.pipeline.commitment_extractor import (
-                _DETECT_SYSTEM_PROMPT,
-            )
-            if system_prompt is _DETECT_SYSTEM_PROMPT:
-                return detect_payload(
-                    detection("We will cut emissions 50% by 2030.", "yes"),
-                    detection("We will be water positive by 2030.", "yes"),
-                    detection("In 2023 we cut water use.", "no",
-                              rejection_reason="past_action"),
+            if system_prompt == detect_text():
+                return verdicts_payload(
+                    verdict(1, "yes"),
+                    verdict(2, "no", rejection_reason="past_action"),
                 )
             enrich_calls.append(prompt)
             return ENRICHMENT
@@ -685,5 +642,174 @@ class TestTwoStageFlow:
                    new=AsyncMock(side_effect=fake)):
             records = await extract_commitments([make_chunk()])
 
-        assert len(records) == 3
-        assert len(enrich_calls) == 2   # only the two positives
+        assert len(records) == 2
+        assert len(enrich_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_commitment_ids_are_unique(self):
+        async def fake(prompt, chunk_index, system_prompt):
+            return verdicts_payload(
+                verdict(1, "no", rejection_reason="past_action"),
+                verdict(2, "no", rejection_reason="past_action"),
+            )
+
+        with patch("backend.core.pipeline.commitment_extractor._call_ollama",
+                   new=AsyncMock(side_effect=fake)):
+            records = await extract_commitments([make_chunk()])
+
+        assert len({r.commitment_id for r in records}) == 2
+
+    @pytest.mark.asyncio
+    async def test_page_reference_falls_back_to_chunk_index(self):
+        async def fake(prompt, chunk_index, system_prompt):
+            return verdicts_payload(
+                verdict(1, "no", rejection_reason="past_action"),
+                verdict(2, "no", rejection_reason="past_action"),
+            )
+
+        with patch("backend.core.pipeline.commitment_extractor._call_ollama",
+                   new=AsyncMock(side_effect=fake)):
+            records = await extract_commitments([make_chunk(index=7)])
+
+        assert records[0].page_reference == "chunk_7"
+
+
+# ---------------------------------------------------------------------------
+# Provenance — every record traceable to a model and an exact prompt version
+# ---------------------------------------------------------------------------
+
+
+class TestProvenance:
+
+    @pytest.mark.asyncio
+    async def test_every_record_carries_model_and_detect_prompt_id(self):
+        async def fake(prompt, chunk_index, system_prompt):
+            return verdicts_payload(
+                verdict(1, "no", rejection_reason="values_statement"),
+                verdict(2, "no", rejection_reason="past_action"),
+            )
+
+        with patch("backend.core.pipeline.commitment_extractor._call_ollama",
+                   new=AsyncMock(side_effect=fake)):
+            records = await extract_commitments([make_chunk()])
+
+        for r in records:
+            assert r.model, "model tag must be recorded per record, not per run"
+            assert r.detect_prompt_id.startswith(DETECT_PROMPT_FILE + "@")
+
+    @pytest.mark.asyncio
+    async def test_enrich_prompt_id_only_on_enriched_records(self):
+        async def fake(prompt, chunk_index, system_prompt):
+            if system_prompt == detect_text():
+                return verdicts_payload(
+                    verdict(1, "yes"),
+                    verdict(2, "no", rejection_reason="past_action"),
+                )
+            return ENRICHMENT
+
+        with patch("backend.core.pipeline.commitment_extractor._call_ollama",
+                   new=AsyncMock(side_effect=fake)):
+            records = await extract_commitments([make_chunk()])
+
+        positive = next(r for r in records if r.is_commitment is CommitmentDecision.YES)
+        negative = next(r for r in records if r.is_commitment is CommitmentDecision.NO)
+        assert positive.enrich_prompt_id.startswith(ENRICH_PROMPT_FILE + "@")
+        assert negative.enrich_prompt_id is None
+
+    def test_prompt_id_is_stable_and_content_addressed(self):
+        a = load_prompt(DETECT_PROMPT_FILE)[1]
+        b = load_prompt(DETECT_PROMPT_FILE)[1]
+        assert a == b
+        assert len(a.split("@")[1]) == 12
+
+
+# ---------------------------------------------------------------------------
+# Prompt content guards — the prompts are the experimental instrument
+# ---------------------------------------------------------------------------
+
+
+class TestPromptsEncodeTheDefinition:
+
+    def _detect(self) -> str:
+        return load_prompt(DETECT_PROMPT_FILE)[0]
+
+    def _enrich(self) -> str:
+        return load_prompt(ENRICH_PROMPT_FILE)[0]
+
+    def test_both_prompts_stay_within_token_budget(self):
+        """A ~1,590-token prompt produced word-salad from llama3.1:8b on a
+        mid-range GPU; ~1,240 was fine. Two-stage exists to stay clear of that
+        ceiling, and this keeps it that way."""
+        for name, prompt in (("detect", self._detect()), ("enrich", self._enrich())):
+            approx = len(prompt) // 4
+            assert approx < PROMPT_TOKEN_BUDGET, f"{name} is ~{approx} tokens"
+
+    def test_prompts_live_on_disk_for_publication(self):
+        from backend.core.pipeline.prompts import PROMPT_DIR
+        assert (PROMPT_DIR / DETECT_PROMPT_FILE).is_file()
+        assert (PROMPT_DIR / ENRICH_PROMPT_FILE).is_file()
+
+    # --- detection prompt -------------------------------------------------
+
+    def test_no_past_action_used_as_a_positive_example(self):
+        assert "reduced Scope 1 emissions by 30%" not in self._detect()
+
+    def test_future_intention_is_the_core_criterion(self):
+        assert "Future intention is the core test" in self._detect()
+
+    def test_requires_a_specific_outcome(self):
+        """The precision failure on chunk 39: 'committed to meeting our own
+        goals' and 'taking responsibility for our operational footprint' were
+        both accepted as commitments."""
+        prompt = self._detect()
+        assert "SPECIFIC environmental action or outcome" in prompt
+        assert "our own goals" in prompt
+        assert "operational" in prompt
+
+    def test_all_four_rejection_categories_present(self):
+        for category in ("past_action", "values_statement",
+                         "factual_disclosure", "description"):
+            assert category in self._detect()
+
+    def test_scope_2_past_action_named_as_a_rejection_example(self):
+        """The exact sentence the previous version silently dropped."""
+        assert "Scope 2 emissions were reduced" in self._detect()
+
+    def test_three_locked_rulings_present(self):
+        prompt = self._detect().lower()
+        assert "conditional commitments count" in prompt
+        assert "restated commitments count" in prompt
+        assert "is evidence" in prompt
+
+    def test_demands_a_verdict_for_every_id(self):
+        prompt = self._detect()
+        assert "every id" in prompt.lower()
+        assert "Do not skip ids" in prompt
+
+    # --- enrichment prompt ------------------------------------------------
+
+    def test_all_seven_structural_fields_present(self):
+        for f in ("target", "quantity", "deadline", "baseline",
+                  "business_unit", "emissions_scope", "depends_on_outside_factors"):
+            assert f in self._enrich()
+
+    def test_all_four_field_statuses_present(self):
+        for status in ("stated", "not_stated", "not_applicable", "unsure"):
+            assert status in self._enrich()
+
+    def test_all_five_verifiability_levels_present(self):
+        for level in ("strong", "moderate", "weak", "none", "unsure"):
+            assert level in self._enrich()
+
+    def test_weak_none_boundary_rule_present(self):
+        assert "PRESENCE of evidence" in self._enrich()
+
+    def test_forbids_inferring_absent_values(self):
+        """Chunk 39 record 2 hallucinated emissions_scope='Scope 1'."""
+        assert "Do not infer a value that is not in the" in self._enrich()
+
+    # --- both -------------------------------------------------------------
+
+    def test_neither_prompt_solicits_governance_claims(self):
+        assert "governance" not in self._detect().lower()
+        assert "governance" not in self._enrich().lower()

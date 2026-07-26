@@ -23,6 +23,7 @@ Recommended model: ``llama3.1:8b-instruct-q4_K_M``
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import Any
 
@@ -45,6 +46,10 @@ from backend.core.models.report import (
     SubstantiationLevel,
 )
 from backend.core.pipeline.chunker import TextChunk
+from backend.core.pipeline.prompts import (
+    PROMPT_TOKEN_BUDGET,  # noqa: F401  (re-exported for tests)
+    load_prompt,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -73,115 +78,42 @@ NUM_CTX = 8192
 RAW_DUMP_DIR: str | None = None
 
 # ---------------------------------------------------------------------------
-# Prompts — TWO STAGE
+# Prompts — TWO STAGE, loaded from scripts/prompts/
 #
-# Empirically, an 8B q4 model on a mid-range GPU degenerates into word-salad
-# once the combined system+user prompt exceeds roughly 1,300 tokens, even with
-# num_ctx set to 8192 (the effective window is clamped below what is requested,
-# most likely by available VRAM). A single ~1,190-token prompt plus a
-# ~400-token chunk crossed that line and produced unusable output.
+# Empirically, an 8B q4 model degenerates into word-salad once the combined
+# system+user prompt exceeds roughly 1,300 tokens, even with num_ctx set to
+# 8192 (the effective window is clamped below what is requested). So the work
+# is split, and each prompt is budget-guarded on load:
 #
-# So the work is split. Each call keeps its prompt well under the ceiling:
+#   STAGE 1  detect   numbered sentences -> one verdict per sentence id
+#   STAGE 2  enrich   one sentence       -> seven fields + verifiability
 #
-#   STAGE 1  detect   chunk -> which sentences are commitments (yes/no/unsure)
-#   STAGE 2  enrich   one sentence -> seven structural fields + verifiability
-#
-# Stage 2 runs only for sentences stage 1 judged "yes", so cost scales with
-# commitment density rather than document length.
+# Stage 1 is given sentences WE have already split, numbered, and it must
+# return a verdict for every id. Earlier the model was asked to find and quote
+# sentences itself; it silently omitted inconvenient ones — notably a Scope 2
+# past-action sentence that should have been an explicit rejection. Numbering
+# makes omissions detectable and fillable, and means record text comes from the
+# source document rather than the model's transcription of it.
 #
 # Definitions are locked in paper/task_definition.md and notes/decisions.md
-# (07/25/2026). Keep both prompts under PROMPT_TOKEN_BUDGET.
+# (07/25/2026).
 # ---------------------------------------------------------------------------
 
-# Rough ceiling per prompt (chars/4). Guarded by a unit test.
-PROMPT_TOKEN_BUDGET = 800
+DETECT_PROMPT_FILE = "detect_v2.txt"
+ENRICH_PROMPT_FILE = "enrich_v1.txt"
 
-_DETECT_SYSTEM_PROMPT = """\
-You find ENVIRONMENTAL COMMITMENTS in corporate sustainability reports.
+# Sentences shorter than this are navigation furniture in PDF-extracted text
+# ("Overview", "Earn trust", "Learn more") and are not judged. They are
+# excluded before numbering, so they never consume an id or output tokens.
+MIN_SENTENCE_CHARS = 25
 
-A commitment is a stated intention to take a FUTURE environmental action or
-reach a FUTURE environmental outcome. Future intention is the core test: if a
-sentence does not point forward in time, it is not a commitment, however
-environmental it sounds.
-
-Reject, with the reason given:
-  past_action        already done. "In 2023 we reduced water use by 12%."
-  values_statement   values or vague aspiration, no measurable action.
-                     "Sustainability is at the heart of what we do."
-                     "We aim to significantly increase recycling."
-  factual_disclosure a fact carrying no promise.
-  description        a product, process, or organization as it exists.
-
-Rulings:
-- Conditional commitments COUNT. "Subject to government policy, we intend to
-  electrify our fleet by 2035" is yes.
-- Restated commitments COUNT. "As announced in 2021, we remain committed to
-  100% renewable electricity by 2030" is yes, restated yes.
-- Third-party validation (e.g. "our targets were validated by SBTi") is
-  EVIDENCE, not a commitment: is_commitment no, is_evidence yes.
-- A past action with a vague forward clause is past_action. "We installed
-  solar at twelve sites and will continue this program" is no.
-
-Judge ONE SENTENCE AT A TIME. Do not split or merge sentences.
-Judge every environmental sentence, including the ones you reject.
-
-Return ONLY JSON:
-{"commitments": [
-  {"text": "<exact sentence>",
-   "is_commitment": "yes|no|unsure",
-   "rejection_reason": "past_action|values_statement|factual_disclosure|description|null",
-   "restated": "yes|no|unsure",
-   "is_evidence": "yes|no|unsure"}
-]}
-If the excerpt has no environmental sentences, return {"commitments": []}
-"""
-
-_ENRICH_SYSTEM_PROMPT = """\
-You record the structure of ONE environmental commitment sentence.
-
-Fill seven fields. Each takes a status, and a value ONLY when "stated":
-  stated          the text gives it        (supply "value")
-  not_stated      the text does not say    (omit "value")
-  not_applicable  cannot apply here        (omit "value")
-  unsure          cannot tell              (omit "value")
-Never guess. "unsure" is always allowed.
-
-  target           what is promised
-  quantity         how much (number or percentage)
-  deadline         by when (year or date)
-  baseline         starting point (baseline year)
-  business_unit    what part of the business
-  emissions_scope  what part of emissions (Scope 1/2/3)
-
-depends_on_outside_factors: yes if the pledge is conditional on policy,
-infrastructure, or third parties; otherwise no.
-
-verifiability, judged from the given text and context ONLY:
-  strong    specific data, checkable datasets, third-party verification
-  moderate  partial supporting evidence, gaps remain
-  weak      thin supporting evidence exists
-  none      no corroborating evidence at all
-  unsure    cannot determine
-weak vs none is about PRESENCE of evidence, not how specific the pledge is.
-
-Return ONLY JSON:
-{"target": {"status": "stated", "value": "..."},
- "quantity": {"status": "not_stated"},
- "deadline": {"status": "stated", "value": "2030"},
- "baseline": {"status": "not_stated"},
- "business_unit": {"status": "not_stated"},
- "emissions_scope": {"status": "not_stated"},
- "depends_on_outside_factors": "yes|no|unsure",
- "verifiability": "strong|moderate|weak|none|unsure",
- "annotator_notes": "<note or null>"}
-"""
+# Cap on sentences per detection call, to keep the user turn bounded.
+MAX_SENTENCES_PER_CALL = 25
 
 _DETECT_USER_TEMPLATE = """\
-Judge the environmental sentences in this excerpt:
+Judge each numbered sentence. Return exactly one verdict per id.
 
----
-{chunk_text}
----
+{numbered}
 """
 
 _ENRICH_USER_TEMPLATE = """\
@@ -191,6 +123,80 @@ Sentence:
 Surrounding context:
 {context}
 """
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split chunk text into candidate sentences for numbering.
+
+    Two competing problems in PDF-extracted text:
+
+    - Sentences are hard-wrapped mid-clause, so raw newlines are not sentence
+      boundaries: "We will be carbon\\nnegative by 2030."
+    - Navigation furniture arrives as its own short lines ("Overview", "Earn
+      trust", "Learn more"). Collapsing all whitespace glues these into one
+      long pseudo-sentence that then passes a naive length filter — this is
+      what polluted chunk 39 of the Microsoft Impact Summary.
+
+    So a line break is treated as a continuation only when the current buffer
+    has no terminal punctuation *and* the next line begins lowercase. Anything
+    else starts a new unit. Units are then split on sentence punctuation and
+    kept only if they are long enough and actually end a sentence.
+
+    Requiring terminal punctuation drops sentences truncated by a chunk
+    boundary. That is intended: a half sentence should not be judged, and the
+    200-character chunk overlap means it usually appears whole in a neighbour.
+
+    Args:
+        text: Raw chunk text.
+
+    Returns:
+        Sentences worth a verdict, in document order.
+    """
+    units: list[str] = []
+    buffer = ""
+
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            if buffer:
+                units.append(buffer)
+                buffer = ""
+            continue
+
+        if not buffer:
+            buffer = line
+            continue
+
+        # Continuation of a hard-wrapped sentence? A digit counts: PDF layout
+        # splits "our Scope\n2 emissions were reduced..." and treating the
+        # numeric line as a new unit beheads the sentence.
+        if not buffer.endswith((".", "!", "?", ":", ";")) and (
+            line[:1].islower() or line[:1].isdigit()
+        ):
+            buffer = f"{buffer} {line}"
+        else:
+            units.append(buffer)
+            buffer = line
+
+    if buffer:
+        units.append(buffer)
+
+    sentences: list[str] = []
+    for unit in units:
+        for part in re.split(r"(?<=[.!?])\s+", unit):
+            candidate = part.strip()
+            if len(candidate) >= MIN_SENTENCE_CHARS and candidate.endswith(
+                (".", "!", "?")
+            ):
+                sentences.append(candidate)
+
+    return sentences
+
+
+def _number_sentences(sentences: list[str]) -> str:
+    """Render sentences as a numbered list for the detection prompt."""
+    return "\n".join(f"{i}. {s}" for i, s in enumerate(sentences, start=1))
+
 
 # ---------------------------------------------------------------------------
 # Retry-decorated Ollama call
@@ -475,6 +481,9 @@ def _dict_to_commitment(
             is_evidence=_coerce_flag(raw.get("is_evidence"), "is_evidence", chunk.index),
             verifiability=verifiability,
             annotator_notes=notes,
+            model=raw.get("model"),
+            detect_prompt_id=raw.get("detect_prompt_id"),
+            enrich_prompt_id=raw.get("enrich_prompt_id"),
         )
 
     except Exception as exc:  # noqa: BLE001
@@ -503,6 +512,7 @@ async def _enrich(
     coercion layer then fills every field with ``unsure``, which is the honest
     outcome when stage 2 produced nothing.
     """
+    enrich_prompt, _ = load_prompt(ENRICH_PROMPT_FILE)
     text = str(detection.get("text", "")).strip()
     prompt = _ENRICH_USER_TEMPLATE.format(
         text=text,
@@ -510,7 +520,7 @@ async def _enrich(
     )
 
     try:
-        raw = await _call_ollama(prompt, chunk.index, _ENRICH_SYSTEM_PROMPT)
+        raw = await _call_ollama(prompt, chunk.index, enrich_prompt)
     except (httpx.HTTPError, httpx.TimeoutException) as exc:
         logger.warning(
             "enrich_call_failed",
@@ -572,23 +582,108 @@ def _mark_fields_not_applicable(detection: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _parse_verdicts_json(
+    raw: str,
+    chunk: TextChunk,
+    sentence_count: int,
+) -> dict[int, dict[str, Any]]:
+    """Parse stage 1 output into ``{sentence_id: verdict}``.
+
+    Ids outside ``1..sentence_count`` are discarded rather than trusted — a
+    model that invents an id has lost track of the list, and mapping that
+    verdict onto a real sentence would attach a judgement to text the model
+    was not looking at.
+
+    Returns an empty dict on any parse failure; never raises.
+    """
+    if RAW_DUMP_DIR:
+        try:
+            from pathlib import Path as _P
+            d = _P(RAW_DUMP_DIR)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"chunk_{chunk.index}_detect.txt").write_text(raw, encoding="utf-8")
+        except OSError as exc:
+            logger.warning("raw_dump_failed", chunk_index=chunk.index, error=str(exc))
+
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = "\n".join(
+            ln for ln in cleaned.splitlines() if not ln.strip().startswith("```")
+        ).strip()
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "json_parse_failed",
+            chunk_index=chunk.index,
+            error=str(exc),
+            raw_preview=cleaned[:200],
+        )
+        return {}
+
+    if not isinstance(parsed, dict) or "verdicts" not in parsed:
+        logger.warning(
+            "unexpected_json_shape",
+            chunk_index=chunk.index,
+            keys=list(parsed.keys()) if isinstance(parsed, dict) else type(parsed).__name__,
+        )
+        return {}
+
+    verdicts = parsed["verdicts"]
+    if not isinstance(verdicts, list):
+        logger.warning("verdicts_field_not_list", chunk_index=chunk.index)
+        return {}
+
+    out: dict[int, dict[str, Any]] = {}
+    for v in verdicts:
+        if not isinstance(v, dict):
+            continue
+        try:
+            vid = int(v.get("id"))
+        except (TypeError, ValueError):
+            logger.warning("verdict_missing_id", chunk_index=chunk.index)
+            continue
+        if not 1 <= vid <= sentence_count:
+            logger.warning(
+                "verdict_id_out_of_range",
+                chunk_index=chunk.index,
+                verdict_id=vid,
+                sentence_count=sentence_count,
+            )
+            continue
+        out[vid] = v
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
 async def extract_commitments(chunks: list[TextChunk]) -> list[ExtractedCommitment]:
     """Extract environmental commitments from document chunks, in two stages.
 
-    Stage 1 sends each chunk to the model and asks only which sentences are
-    commitments. Stage 2 sends each positive sentence back on its own and asks
-    for its seven structural fields and verifiability level.
+    Stage 1 splits a chunk into numbered sentences and asks the model for one
+    verdict per id. Stage 2 sends each positive sentence back on its own and
+    asks for its seven structural fields and verifiability level.
 
-    The split exists because a single combined prompt exceeded the effective
-    context window of an 8B model on mid-range hardware and produced degenerate
-    output. Each stage's prompt stays under ``PROMPT_TOKEN_BUDGET``.
+    Two properties follow from numbering the sentences ourselves:
+
+    - **No silent omissions.** Any id the model fails to return is recorded as
+      ``unsure`` with a note, rather than vanishing. An earlier version let the
+      model choose which sentences to mention and it quietly dropped a
+      past-action sentence instead of rejecting it.
+    - **No transcription drift.** Record text is taken from the source
+      document by id, so a record can never contain a sentence the model
+      paraphrased or invented.
 
     Records judged NOT a commitment are retained — the benchmark needs
     negatives to measure precision. They skip stage 2 and their structural
     fields are marked ``not_applicable``.
 
-    Malformed model output is logged and skipped; this function never raises
-    because of it.
+    Every record carries the model tag and the identifiers of both prompts.
 
     Args:
         chunks: Ordered list of :class:`TextChunk` objects from
@@ -596,27 +691,41 @@ async def extract_commitments(chunks: list[TextChunk]) -> list[ExtractedCommitme
 
     Returns:
         Flat list of all :class:`ExtractedCommitment` objects across all chunks.
-
-    Example:
-        >>> chunks = chunk_text(document_text)
-        >>> records = await extract_commitments(chunks)
-        >>> positives = [r for r in records if r.is_commitment.value == "yes"]
     """
     if not chunks:
         logger.warning("extract_commitments called with empty chunk list")
         return []
+
+    detect_prompt, detect_id = load_prompt(DETECT_PROMPT_FILE)
+    _, enrich_id = load_prompt(ENRICH_PROMPT_FILE)
+    model = settings.ollama_model
+
+    logger.info(
+        "commitment_extraction_start",
+        model=model,
+        detect_prompt=detect_id,
+        enrich_prompt=enrich_id,
+        chunks=len(chunks),
+    )
 
     all_records: list[ExtractedCommitment] = []
 
     for chunk in chunks:
         log = logger.bind(chunk_index=chunk.index, total_chunks=len(chunks))
 
-        # --- Stage 1: detection ---------------------------------------------
-        detect_prompt = _DETECT_USER_TEMPLATE.format(chunk_text=chunk.text)
+        sentences = _split_sentences(chunk.text)[:MAX_SENTENCES_PER_CALL]
+        if not sentences:
+            log.info("chunk_has_no_judgeable_sentences")
+            continue
+
+        # --- Stage 1: detection over numbered sentences ----------------------
+        detect_user = _DETECT_USER_TEMPLATE.format(
+            numbered=_number_sentences(sentences)
+        )
 
         try:
             raw_response = await _call_ollama(
-                detect_prompt, chunk.index, _DETECT_SYSTEM_PROMPT
+                detect_user, chunk.index, detect_prompt
             )
         except (httpx.HTTPError, httpx.TimeoutException) as exc:
             # str() on httpx timeout exceptions is often empty — use repr so the
@@ -630,15 +739,38 @@ async def extract_commitments(chunks: list[TextChunk]) -> list[ExtractedCommitme
             )
             continue
 
-        detections = _parse_commitments_json(raw_response, chunk)
+        verdicts = _parse_verdicts_json(raw_response, chunk, len(sentences))
+        missing = [i for i in range(1, len(sentences) + 1) if i not in verdicts]
+        if missing:
+            log.warning(
+                "detection_incomplete",
+                missing_ids=missing,
+                returned=len(verdicts),
+                expected=len(sentences),
+            )
 
         # --- Stage 2: enrichment, positives only -----------------------------
         chunk_records: list[ExtractedCommitment] = []
         enriched_count = 0
 
-        for detection in detections:
-            if not isinstance(detection, dict):
-                continue
+        for idx, sentence in enumerate(sentences, start=1):
+            verdict = verdicts.get(idx)
+
+            if verdict is None:
+                # Model skipped this id. Record it as unsure rather than
+                # dropping it — a silently missing sentence is invisible in
+                # the results and would inflate apparent precision.
+                detection: dict[str, Any] = {
+                    "text": sentence,
+                    "is_commitment": "unsure",
+                    "annotator_notes": "stage 1 returned no verdict for this sentence",
+                }
+            else:
+                detection = dict(verdict)
+                # Always use OUR sentence text, never the model's echo.
+                detection["text"] = sentence
+
+            detection.setdefault("context", chunk.text[:400])
 
             decision = str(detection.get("is_commitment", "")).lower().strip()
             if decision == "yes":
@@ -647,19 +779,31 @@ async def extract_commitments(chunks: list[TextChunk]) -> list[ExtractedCommitme
             else:
                 merged = _mark_fields_not_applicable(detection)
 
+            merged["model"] = model
+            merged["detect_prompt_id"] = detect_id
+            merged["enrich_prompt_id"] = enrich_id if decision == "yes" else None
+
             record = _dict_to_commitment(merged, chunk)
             if record is not None:
                 chunk_records.append(record)
 
         log.info(
             "chunk_processed",
+            sentences=len(sentences),
             records_found=len(chunk_records),
             positives=sum(
                 1 for r in chunk_records
                 if r.is_commitment is CommitmentDecision.YES
             ),
+            rejections=sum(
+                1 for r in chunk_records
+                if r.is_commitment is CommitmentDecision.NO
+            ),
+            unsure=sum(
+                1 for r in chunk_records
+                if r.is_commitment is CommitmentDecision.UNSURE
+            ),
             enrich_calls=enriched_count,
-            detections_received=len(detections),
         )
         all_records.extend(chunk_records)
 
@@ -669,6 +813,9 @@ async def extract_commitments(chunks: list[TextChunk]) -> list[ExtractedCommitme
         total_records=len(all_records),
         positives=sum(
             1 for r in all_records if r.is_commitment is CommitmentDecision.YES
+        ),
+        rejections=sum(
+            1 for r in all_records if r.is_commitment is CommitmentDecision.NO
         ),
     )
     return all_records
