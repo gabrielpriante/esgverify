@@ -7,15 +7,24 @@ as part of the offline test suite.
 
 Usage (from the repository root):
 
-    python -m scripts.run_commitment_extraction \\
-        --pdf "/path/to/The-2023-Impact-Summary.pdf" \\
-        --out data/samples/microsoft_2023_commitments.json
+    # auto-named: data/samples/<document>_<YYYY-MM-DD>.json
+    python scripts/run_commitment_extraction.py \\
+        --pdf "/path/to/The-2023-Impact-Summary.pdf"
+
+    # explicit path
+    python scripts/run_commitment_extraction.py \\
+        --pdf "/path/to/report.pdf" --out data/samples/custom.json
 
 Options:
-    --limit N     Process only the first N chunks. Start small — a 22 MB report
-                  is hundreds of chunks and a full pass takes a long time on an
-                  8 GB card.
-    --model NAME  Override OLLAMA_MODEL for this run.
+    --out-dir DIR  Where auto-named output goes (default data/samples).
+    --overwrite    Replace an existing auto-named file instead of writing _2.
+    --limit N      Process only N chunks. Start small — a 22 MB report is
+                   dozens of chunks and a full pass takes a while on an 8 GB card.
+    --start N      Chunk index to begin at; commitments usually sit mid-document.
+    --model NAME   Override OLLAMA_MODEL for this run.
+
+Keep OLLAMA_NUM_PARALLEL unset on a small card: it divides the context window
+between slots, which silently truncates the prompt and produces word-salad.
 """
 
 from __future__ import annotations
@@ -26,6 +35,7 @@ import json
 import sys
 import time
 from collections import Counter
+from datetime import date
 from pathlib import Path
 
 # Allow running as a plain script from the repo root as well as via -m
@@ -41,7 +51,25 @@ from backend.core.pipeline.commitment_extractor import (  # noqa: E402
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pdf", required=True, help="Path to the PDF to process")
-    parser.add_argument("--out", required=True, help="Path for the JSON output")
+    parser.add_argument(
+        "--out", default=None,
+        help=(
+            "Explicit output path. Omit it and the name is derived from the "
+            "PDF: <document>_<YYYY-MM-DD>.json inside --out-dir."
+        ),
+    )
+    parser.add_argument(
+        "--out-dir", default="data/samples",
+        help="Directory for auto-named output (default data/samples)",
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true",
+        help=(
+            "Overwrite an existing auto-named file. Without it, a second run "
+            "on the same document and day is written as _2, _3, ... rather "
+            "than clobbering the earlier result."
+        ),
+    )
     parser.add_argument(
         "--limit", type=int, default=None,
         help="Process only N chunks (recommended for a first run)",
@@ -103,6 +131,36 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_out_path(args: argparse.Namespace, pdf_path: Path) -> Path:
+    """Decide where this run's JSON goes.
+
+    An explicit --out always wins. Otherwise the name is derived from the
+    document and today's date, which is what makes a bulk corpus pass possible
+    without naming 130 files by hand.
+
+    Re-running the same document on the same day does NOT overwrite by default.
+    A long bulk run that is restarted should not silently destroy the results
+    of the first attempt; a numeric suffix is cheap and recoverable, a lost
+    overnight run is not.
+    """
+    if args.out:
+        return Path(args.out)
+
+    stem = pdf_path.stem
+    out_dir = Path(args.out_dir)
+    candidate = out_dir / f"{stem}_{date.today().isoformat()}.json"
+
+    if args.overwrite or not candidate.exists():
+        return candidate
+
+    n = 2
+    while True:
+        alt = out_dir / f"{stem}_{date.today().isoformat()}_{n}.json"
+        if not alt.exists():
+            return alt
+        n += 1
+
+
 async def main() -> int:
     args = parse_args()
 
@@ -134,11 +192,13 @@ async def main() -> int:
     print(f"Timeout: {settings.ollama_timeout_seconds}s per request")
     _override = commitment_extractor.NUM_PREDICT
     print(f"Context: num_ctx={commitment_extractor.NUM_CTX}")
-    print(f"Output:  detect={_override or commitment_extractor.DETECT_NUM_PREDICT}, "
+    print(f"Tokens:  detect={_override or commitment_extractor.DETECT_NUM_PREDICT}, "
           f"enrich={_override or commitment_extractor.ENRICH_NUM_PREDICT} tokens"
           + ("  (single-cap override)" if _override else ""))
     print(f"Parallel:{commitment_extractor.CONCURRENCY} requests in flight")
+    out_path = resolve_out_path(args, pdf_path)
     print(f"PDF:     {pdf_path.name}")
+    print(f"Output:  {out_path}")
 
     # --- 1. PDF -> text ----------------------------------------------------
     import fitz  # pymupdf
@@ -173,12 +233,12 @@ async def main() -> int:
     elapsed = time.monotonic() - started
 
     # --- 4. write output ---------------------------------------------------
-    out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
         json.dumps(
             {
                 "source_pdf": pdf_path.name,
+                "run_date": date.today().isoformat(),
                 "model": settings.ollama_model,
                 "pages": page_count,
                 "chunks_total": total_chunks,
