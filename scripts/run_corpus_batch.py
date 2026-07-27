@@ -45,6 +45,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 RUNNER = REPO_ROOT / "scripts" / "run_commitment_extraction.py"
 
 DEFAULT_CORPUS = Path(
@@ -55,6 +56,36 @@ DEFAULT_CORPUS = Path(
 # the annotation guideline was built on them, so including them would mean
 # reporting results on documents the instrument was fitted to.
 EXCLUDED_DIRS = {"microsoft", "jnj"}
+
+
+def preflight(model: str, base_url: str) -> tuple[bool, str]:
+    """Confirm Ollama is up and the model is present, before committing a night.
+
+    AEP 2015 ran 257 chunks against a dead server, took 51 minutes, exited 0,
+    and was cached as complete. Ten seconds of checking prevents that class of
+    loss entirely.
+    """
+    try:
+        import httpx
+    except ImportError:
+        return True, "httpx unavailable; skipping preflight"
+
+    try:
+        r = httpx.get(f"{base_url}/api/tags", timeout=10)
+        r.raise_for_status()
+        tags = [m.get("name", "") for m in r.json().get("models", [])]
+    except Exception as exc:  # noqa: BLE001
+        return False, (
+            f"cannot reach Ollama at {base_url} ({type(exc).__name__}). "
+            f"Start it and check `ollama list`."
+        )
+
+    if model not in tags:
+        return False, (
+            f"model {model!r} is not pulled. Available: {', '.join(tags) or '(none)'}. "
+            f"Run: ollama pull {model}"
+        )
+    return True, f"Ollama reachable, {model} present ({len(tags)} models installed)"
 
 
 def parse_args() -> argparse.Namespace:
@@ -129,6 +160,30 @@ def existing_output(out_dir: Path, pdf: Path) -> Path | None:
     return matches[0] if matches else None
 
 
+def quarantine(out_path: Path) -> Path | None:
+    """Move a failed run's output out of the resume path.
+
+    A failed run that leaves a file behind is worse than one that leaves
+    nothing: the resume check globs <stem>_*.json, so the failure would be
+    cached as completed work and never retried. Failed output is preserved for
+    inspection under failed/, where the glob cannot see it.
+    """
+    if not out_path.is_file():
+        return None
+    dest_dir = out_path.parent / "failed"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / out_path.name
+    n = 2
+    while dest.exists():
+        dest = dest_dir / f"{out_path.stem}_{n}{out_path.suffix}"
+        n += 1
+    try:
+        out_path.replace(dest)
+        return dest
+    except OSError:
+        return None
+
+
 def count_records(path: Path) -> tuple[int, int]:
     """Return (total records, commitments) from a result file."""
     try:
@@ -140,8 +195,18 @@ def count_records(path: Path) -> tuple[int, int]:
         return 0, 0
 
 
-def run_one(pdf: Path, out_path: Path, args: argparse.Namespace) -> tuple[bool, str]:
+def run_one(
+    pdf: Path,
+    out_path: Path,
+    args: argparse.Namespace,
+    doc_log_dir: Path,
+) -> tuple[bool, str]:
     """Run the single-document extractor in a subprocess.
+
+    The child's stdout and stderr are ALWAYS written to logs/docs/<stem>.log,
+    on success as well as failure. The first version discarded them on success,
+    which is how 257 `ollama_call_failed_after_retries` messages vanished and a
+    dead-server run looked like a clean one.
 
     Returns (succeeded, detail). Never raises: a failure here must not end the
     batch.
@@ -164,13 +229,33 @@ def run_one(pdf: Path, out_path: Path, args: argparse.Namespace) -> tuple[bool, 
     except Exception as exc:  # noqa: BLE001
         return False, f"{type(exc).__name__}: {exc}"
 
+    # Persist child output unconditionally.
+    doc_log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = doc_log_dir / f"{pdf.stem}.log"
+    try:
+        log_file.write_text(
+            f"=== command ===\n{' '.join(cmd)}\n\n"
+            f"=== exit code {proc.returncode} ===\n\n"
+            f"=== stdout ===\n{proc.stdout}\n\n"
+            f"=== stderr ===\n{proc.stderr}\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip().splitlines()
         detail = tail[-1] if tail else f"exit code {proc.returncode}"
+        if proc.returncode == 2:
+            detail = f"zero records produced - {detail}"
         return False, detail[:200]
 
     if not out_path.is_file():
         return False, "runner reported success but wrote no output file"
+
+    records, _ = count_records(out_path)
+    if records == 0:
+        return False, "output file contains zero records"
 
     return True, ""
 
@@ -200,6 +285,18 @@ def main() -> int:
     say(f"  model    {args.model}   concurrency=1 (single slot)")
     say(f"  excluded {sorted(excluded)}")
     say("=" * 78)
+
+    doc_log_dir = log_path.parent / "docs"
+
+    if not args.dry_run:
+        from backend.core.config import settings as _settings
+        ok, msg = preflight(args.model, _settings.ollama_base_url)
+        say(f"PREFLIGHT: {msg}")
+        if not ok:
+            say("Aborting before any document is processed.")
+            say.close()
+            return 1
+        say("")
 
     all_pdfs = discover(corpus_dir, excluded)
     todo = [p for p in all_pdfs if existing_output(out_dir, p) is None]
@@ -244,7 +341,7 @@ def main() -> int:
 
         say(f"[{i:3d}/{len(todo)}] START {rel}  {datetime.now():%H:%M:%S}")
         started = time.monotonic()
-        ok, detail = run_one(pdf, out_path, args)
+        ok, detail = run_one(pdf, out_path, args, doc_log_dir)
         elapsed = time.monotonic() - started
 
         if ok:
@@ -255,8 +352,12 @@ def main() -> int:
             say(f"[{i:3d}/{len(todo)}] DONE  {rel}  "
                 f"{records} records, {commitments} commitments, {elapsed / 60:.1f} min")
         else:
+            moved = quarantine(out_path)
             failed.append((str(rel), detail))
             say(f"[{i:3d}/{len(todo)}] FAIL  {rel}  after {elapsed / 60:.1f} min — {detail}")
+            say(f"          child log: {doc_log_dir / (pdf.stem + '.log')}")
+            if moved:
+                say(f"          output quarantined to {moved} (will be retried)")
 
         done_so_far = processed + len(failed)
         if done_so_far and done_so_far < len(todo):

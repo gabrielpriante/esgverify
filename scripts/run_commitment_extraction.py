@@ -276,11 +276,23 @@ async def main() -> int:
     print(f"  evidence (not commit):{evidence}")
 
     if not records:
+        # Zero records from a document that produced chunks means every model
+        # call failed. It is NOT "this report contains no commitments": every
+        # sentence yields a record regardless of the verdict, so a working
+        # pipeline on a text-bearing document cannot return nothing.
+        #
+        # Exiting non-zero matters because a batch caller must not cache this
+        # as completed work. AEP 2015 ran 257 chunks against a dead Ollama,
+        # exited 0, and was recorded as done.
         print(
-            "\nNOTE: zero records. Check that Ollama is running and the model "
-            "is pulled, then re-run with --limit 3 and inspect the logs.",
+            f"\nFAILURE: processed {len(chunks)} chunks and produced 0 records.\n"
+            f"Every model call failed. Check that Ollama is running "
+            f"(`ollama list`) and that {settings.ollama_model} is pulled.\n"
+            f"This is not a document with no commitments — that would still "
+            f"produce one record per sentence.",
             file=sys.stderr,
         )
+        return 2
 
     return 0
 
